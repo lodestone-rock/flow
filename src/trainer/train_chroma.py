@@ -773,9 +773,8 @@ def train_chroma(rank, world_size, debug=False):
             if not debug:
                 synchronize_gradients(model)
 
-            scheduler.step()
-
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
 
             if rank == 0:

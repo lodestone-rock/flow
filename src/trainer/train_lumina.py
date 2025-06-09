@@ -734,9 +734,8 @@ def train_lumina(rank, world_size, debug=False):
             if not debug:
                 synchronize_gradients(model)
 
-            scheduler.step()
-
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
 
             if training_config.wandb_project is not None and rank == 0:

@@ -249,7 +249,7 @@ class Chroma(nn.Module):
             # just in case in different GPU for simple pipeline parallel
             if self.training:
                 img, txt = ckpt.checkpoint(
-                    block, img, txt, pe, double_mod, txt_img_mask
+                    block, img, txt, pe, double_mod, txt_img_mask, use_reentrant=False
                 )
             else:
                 img, txt = block(
@@ -260,7 +260,7 @@ class Chroma(nn.Module):
         for i, block in enumerate(self.single_blocks):
             single_mod = mod_vectors_dict[f"single_blocks.{i}.modulation.lin"]
             if self.training:
-                img = ckpt.checkpoint(block, img, pe, single_mod, txt_img_mask)
+                img = ckpt.checkpoint(block, img, pe, single_mod, txt_img_mask, use_reentrant=False)
             else:
                 img = block(img, pe=pe, distill_vec=single_mod, mask=txt_img_mask)
         img = img[:, txt.shape[1] :, ...]
