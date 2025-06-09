@@ -5,7 +5,10 @@ import json
 import random
 from tqdm import tqdm
 
-csv.field_size_limit(sys.maxsize)
+try:
+    csv.field_size_limit(sys.maxsize)
+except OverflowError:
+    csv.field_size_limit(2147483647)
 
 
 def save_as_jsonl(data, filename):
@@ -18,9 +21,9 @@ def save_as_jsonl(data, filename):
     if os.path.join(*os.path.split(filename)[:-1]) != "":
         os.makedirs(os.path.join(*os.path.split(filename)[:-1]), exist_ok=True)
 
-    with open(filename, "w") as f:
+    with open(filename, "w", encoding="utf-8") as f:
         for item in tqdm(data):
-            json.dump(item, f)
+            json.dump(item, f, ensure_ascii=False)
             f.write("\n")
 
 
@@ -35,7 +38,7 @@ def read_jsonl(filename):
     """
 
     data = []
-    with open(filename, "r") as f:
+    with open(filename, "r", encoding="utf-8") as f:
         for line in tqdm(f):
             data.append(json.loads(line))
     return data
