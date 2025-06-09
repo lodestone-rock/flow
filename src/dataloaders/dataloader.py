@@ -258,7 +258,7 @@ class TextImageDataset(Dataset):
             else:
                 if img_array.ndim == 2:
                     image = Image.fromarray(img_array, mode='L')
-                elif img_array.ndim == 3 or (img_array.ndim == 4 and img_array.shape[0] == 1):
+                elif img_array.ndim == 3 or (img_array.ndim == 4):
                     if img_array.ndim == 4:
                         # When the image has a frame dimension, only the first frame is taken.
                         img_array = img_array[0]
