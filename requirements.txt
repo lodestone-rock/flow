@@ -1,5 +1,5 @@
-torch==2.6.0
-torchvision==0.21.0
+torch>=2.6.0
+torchvision>=0.21.0
 numpy
 matplotlib
 tensorboard
@@ -7,7 +7,10 @@ torch_tb_profiler
 tqdm
 wandb
 einops
+pillow-avif-plugin
 pillow-jxl-plugin
+imageio[pillow]
+imageio[pyav]
 transformers
 safetensors
 sentencepiece
@@ -16,3 +19,5 @@ torchastic
 torch-linear-assignment
 huggingface_hub
 scipy
+triton; sys_platform != "win32"
+triton-windows; sys_platform == "win32"
