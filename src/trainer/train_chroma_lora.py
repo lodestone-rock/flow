@@ -48,6 +48,9 @@ from src.lora_and_quant import (
 from huggingface_hub import HfApi, upload_file
 import time
 
+from aim import Run, Image as AimImage
+from datetime import datetime
+from PIL import Image as PILImage
 
 @dataclass
 class TrainingConfig:
@@ -61,10 +64,10 @@ class TrainingConfig:
     reset_optim_every: int
     save_every: int
     save_folder: str
-    wandb_key: Optional[str] = None
-    wandb_project: Optional[str] = None
-    wandb_run: Optional[str] = None
-    wandb_entity: Optional[str] = None
+    aim_path: Optional[str] = None
+    aim_experiment_name: Optional[str] = None
+    aim_hash: Optional[str] = None
+    aim_steps: Optional[int] = 0
     hf_repo_id: Optional[str] = None
     hf_token: Optional[str] = None
 
@@ -400,7 +403,7 @@ def inference_wrapper(
                 return_tensors="pt",
             ).to(t5.device)
 
-            t5_embed_neg = t5(text_inputs_neg.input_ids, text_inputs.attention_mask).to(
+            t5_embed_neg = t5(text_inputs_neg.input_ids, text_inputs_neg.attention_mask).to(
                 rank
             )
 
@@ -455,16 +458,16 @@ def train_chroma(rank, world_size, debug=False):
         InferenceConfig(**conf) for conf in config_data["extra_inference_config"]
     ]
 
-    # wandb logging
-    if training_config.wandb_project is not None and rank == 0:
-        current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        if training_config.wandb_key:
-            wandb.login(key=training_config.wandb_key)
-        wandb.init(
-            project=training_config.wandb_project,
-            name=f"{training_config.wandb_run}_{current_datetime}",
-            entity=training_config.wandb_entity,
-        )
+
+    # Setup Aim run
+    if training_config.aim_path is not None and rank == 0:
+        # current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        run = Run(repo=training_config.aim_path, run_hash=training_config.aim_hash, experiment=training_config.aim_experiment_name)
+
+        hparams = config_data.copy()
+        hparams["training"]['aim_path'] = None
+        run["hparams"] = hparams
+
 
     os.makedirs(training_config.save_folder, exist_ok=True)
     # paste the training config for this run
@@ -557,6 +560,8 @@ def train_chroma(rank, world_size, debug=False):
     scheduler = None
     hooks = []
     optimizer_counter = 0
+
+    global_step = training_config.aim_steps
     while True:
         training_config.master_seed += 1
         torch.manual_seed(training_config.master_seed)
@@ -786,8 +791,9 @@ def train_chroma(rank, world_size, debug=False):
             scheduler.step()
             optimizer.zero_grad()
 
-            if training_config.wandb_project is not None and rank == 0:
-                wandb.log({"loss": loss_log, "lr": training_config.lr})
+            if rank == 0:
+                run.track(loss_log, name='loss', step=global_step)
+                run.track(training_config.lr, name='learning_rate', step=global_step)
 
             optimizer_state_to(optimizer, "cpu")
             torch.cuda.empty_cache()
@@ -928,20 +934,20 @@ def train_chroma(rank, world_size, debug=False):
                     save_image(final_grid, file_path)
                     print(f"Combined image grid saved to {file_path}")
 
-                    # upload preview to wandb
-                    if training_config.wandb_project is not None:
-                        wandb.log(
-                            {
-                                "example_image": wandb.Image(
-                                    file_path,
-                                    caption="\n".join(preview_prompts + all_prompt),
-                                )
-                            }
-                        )
+                    # upload preview to aim
+
+                    # Load your file_path into a PIL image if it isn't already
+                    img_pil = PILImage.open(file_path)
+
+                    # Wrap it for Aim
+                    aim_img = AimImage(img_pil, caption="\n".join(preview_prompts + all_prompt))
+
+                    run.track(aim_img, name='example_image', step=global_step)
 
             # flush
             acc_latents = []
             acc_embeddings = []
+            global_step += 1
 
         # save final model
         if rank == 0:
