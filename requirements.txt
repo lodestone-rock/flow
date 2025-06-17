@@ -21,3 +21,4 @@ huggingface_hub
 scipy
 triton; sys_platform != "win32"
 triton-windows; sys_platform == "win32"
+aim

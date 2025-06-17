@@ -21,7 +21,6 @@ from torchastic import Compass, StochasticAccumulator
 import random
 
 from transformers import T5Tokenizer
-import wandb
 
 from src.dataloaders.dataloader import TextImageDataset
 from src.models.chroma.model import Chroma, chroma_params
