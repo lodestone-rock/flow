@@ -5,20 +5,18 @@ matplotlib
 tensorboard
 torch_tb_profiler
 tqdm
-wandb
 einops
 pillow-avif-plugin
 pillow-jxl-plugin
-imageio[pillow]
 imageio[pyav]
 transformers
 safetensors
 sentencepiece
-bitsandbytes==0.45.3
+bitsandbytes>=0.45.3
 torchastic
 torch-linear-assignment
 huggingface_hub
 scipy
+aim; sys_platform != "win32"
 triton; sys_platform != "win32"
 triton-windows; sys_platform == "win32"
-aim

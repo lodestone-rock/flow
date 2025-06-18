@@ -93,7 +93,7 @@ The trainer is configured via a JSON file with the following sections:
 | `trained_double_blocks` | Number of trainable transformer double blocks |
 | `save_every` | Save model checkpoint every X steps |
 | `save_folder` | Directory to save model checkpoints |
-| `aim_path` | Aim directory path (optional) |
+| `aim_path` | Aim directory path (optional, Windows need to install by yourself) |
 | `aim_experiment_name` | Aim experiment name (optional) |
 | `aim_hash` | Aim hash (optional) |
 | `aim_steps` | Aim steps (optional) |
