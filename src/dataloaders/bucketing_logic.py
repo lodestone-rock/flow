@@ -15,7 +15,10 @@ import psutil
 
 from .utils import read_jsonl
 
-csv.field_size_limit(sys.maxsize)
+try:
+    csv.field_size_limit(sys.maxsize)
+except OverflowError:
+    csv.field_size_limit(2147483647)
 log = logging.getLogger(__name__)
 
 
