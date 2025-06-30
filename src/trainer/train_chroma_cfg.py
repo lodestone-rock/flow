@@ -1,4 +1,4 @@
-import platform
+import sys
 import os
 import json
 from datetime import datetime
@@ -17,10 +17,11 @@ from torchvision.utils import save_image
 from torchvision.utils import save_image, make_grid
 from torch.utils.data import DataLoader
 
-from torchastic import AdamW, StochasticAccumulator
+from torchastic import Compass, StochasticAccumulator
 import random
 
 from transformers import T5Tokenizer
+import wandb
 
 from src.dataloaders.dataloader import TextImageDataset
 from src.models.chroma.model import Chroma, chroma_params
@@ -36,13 +37,7 @@ from src.models.chroma.module.autoencoder import AutoEncoder, ae_params
 from src.math_utils import cosine_optimal_transport
 from src.models.chroma.module.t5 import T5EncoderModel, T5Config, replace_keys
 from src.general_utils import load_file_multipart, load_selected_keys, load_safetensors
-from src.lora_and_quant import (
-    swap_linear_simple,
-    LinearWithLoRA,
-    Quantized4BitLinearWithLoRA,
-    Quantized8BitLinearWithLoRA,
-    find_lora_params,
-)
+import src.lora_and_quant as lora_and_quant
 
 from huggingface_hub import HfApi, upload_file
 import time
@@ -60,15 +55,19 @@ class TrainingConfig:
     lr: float
     weight_decay: float
     warmup_steps: int
-    reset_optim_every: int
+    change_layer_every: int
+    trained_single_blocks: int
+    trained_double_blocks: int
     save_every: int
     save_folder: str
+    cfg_scale_strength: str
     aim_path: Optional[str] = None
     aim_experiment_name: Optional[str] = None
     aim_hash: Optional[str] = None
     aim_steps: Optional[int] = 0
     hf_repo_id: Optional[str] = None
     hf_token: Optional[str] = None
+    
 
 
 @dataclass
@@ -113,14 +112,6 @@ class ModelConfig:
     t5_max_length: int
 
 
-@dataclass
-class LoraConfig:
-    rank: int
-    alpha: int
-    target_layers: list[str]
-    base_model_quant_level: Optional[str] = "full"
-
-
 def setup_distributed(rank, world_size):
     """Initialize distributed training"""
     os.environ["MASTER_ADDR"] = "localhost"
@@ -128,13 +119,10 @@ def setup_distributed(rank, world_size):
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Initialize process group
-    backend = "nccl"  # Default backend for distributed training
-    if platform.system() == "Windows":
-        # Windows does not support NCCL, use GLOO instead
-        backend = "gloo"
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
 
@@ -241,7 +229,7 @@ def init_optimizer(model, trained_layer_keywords, lr, wd, warmup_steps):
     # return hooks so it can be released later on
     hooks = StochasticAccumulator.assign_hooks(model)
     # init optimizer
-    optimizer = AdamW(
+    optimizer = Compass(
         [
             {
                 "params": [
@@ -292,7 +280,8 @@ def optimizer_state_to(optimizer, device):
                 state[key] = value.to(device, non_blocking=True)
 
 
-def save_part(model, trained_layer_keywords, path):
+def save_part(model, trained_layer_keywords, counter, save_folder):
+    os.makedirs(save_folder, exist_ok=True)
     full_state_dict = model.state_dict()
 
     filtered_state_dict = {}
@@ -300,7 +289,9 @@ def save_part(model, trained_layer_keywords, path):
         if any(keyword in k for keyword in trained_layer_keywords):
             filtered_state_dict[k] = v
 
-    torch.save(filtered_state_dict, path)
+    torch.save(
+        filtered_state_dict, os.path.join(save_folder, f"trained_part_{counter}.pth")
+    )
 
 
 def cast_linear(module, dtype):
@@ -318,17 +309,17 @@ def cast_linear(module, dtype):
 
 def save_config_to_json(filepath: str, **configs):
     json_data = {key: asdict(value) for key, value in configs.items()}
-    with open(filepath, "w", encoding="utf-8") as json_file:
-        json.dump(json_data, json_file, indent=4, ensure_ascii=False)
+    with open(filepath, "w") as json_file:
+        json.dump(json_data, json_file, indent=4)
 
 
 def dump_dict_to_json(data, file_path):
-    with open(file_path, "w", encoding="utf-8") as json_file:
-        json.dump(data, json_file, indent=4, ensure_ascii=False)
+    with open(file_path, "w") as json_file:
+        json.dump(data, json_file, indent=4)
 
 
 def load_config_from_json(filepath: str):
-    with open(filepath, "r", encoding="utf-8") as json_file:
+    with open(filepath, "r") as json_file:
         return json.load(json_file)
 
 
@@ -377,8 +368,8 @@ def inference_wrapper(
 
             timesteps = get_schedule(STEPS, noise.shape[1])
 
-            model.to("cpu")
-            ae.to("cpu")
+            # model.to("cpu")
+            # ae.to("cpu")
             t5.to(rank)  # load t5 to gpu
             text_inputs = t5_tokenizer(
                 PROMPT,
@@ -428,13 +419,13 @@ def inference_wrapper(
                 FIRST_N_STEPS_WITHOUT_CFG,
             )
 
-            model.to("cpu")
+            # model.to("cpu")
             t5.to("cpu")
             ae.to(rank)  # load ae to gpu
             output_image = ae.decode(vae_unflatten(latent_cfg, shape))
 
             # restore back state
-            model.to("cpu")
+            # model.to("cpu")
             t5.to("cpu")
             ae.to("cpu")
 
@@ -446,13 +437,12 @@ def train_chroma(rank, world_size, debug=False):
     if not debug:
         setup_distributed(rank, world_size)
 
-    config_data = load_config_from_json("training_config_chroma_lora.json")
+    config_data = load_config_from_json("training_config_cfg.json")
 
     training_config = TrainingConfig(**config_data["training"])
     inference_config = InferenceConfig(**config_data["inference"])
     dataloader_config = DataloaderConfig(**config_data["dataloader"])
     model_config = ModelConfig(**config_data["model"])
-    lora_config = LoraConfig(**config_data["lora"])
     extra_inference_config = [
         InferenceConfig(**conf) for conf in config_data["extra_inference_config"]
     ]
@@ -461,7 +451,7 @@ def train_chroma(rank, world_size, debug=False):
     # Setup Aim run
     if training_config.aim_path is not None and rank == 0:
         # current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        run = Run(repo=training_config.aim_path, run_hash=training_config.aim_hash, experiment=training_config.aim_experiment_name)
+        run = Run(repo=training_config.aim_path, run_hash=training_config.aim_hash, experiment=training_config.aim_experiment_name, force_resume=True)
 
         hparams = config_data.copy()
         hparams["training"]['aim_path'] = None
@@ -486,28 +476,6 @@ def train_chroma(rank, world_size, debug=False):
         with torch.device("meta"):
             model = Chroma(chroma_params)
         model.load_state_dict(load_safetensors(model_config.chroma_path), assign=True)
-        model.to(torch.bfloat16)
-        model.to(rank)
-
-        # set trainable lora layer
-        lora_module = {
-            "full": LinearWithLoRA,
-            "8bit": Quantized8BitLinearWithLoRA,
-            "4bit": Quantized4BitLinearWithLoRA,
-        }
-
-        swap_linear_simple(
-            model,
-            lora_module[lora_config.base_model_quant_level],
-            rank=lora_config.rank,
-            alpha=lora_config.alpha,
-            include_keywords=lora_config.target_layers,
-        )
-
-        trained_layer_keywords = []
-        for n, p in find_lora_params(model):
-            trained_layer_keywords.append(n)
-            p.data = p.data.to(torch.bfloat16)
 
         # randomly train inner layers at a time
         trained_double_blocks = list(range(len(model.double_blocks)))
@@ -559,6 +527,7 @@ def train_chroma(rank, world_size, debug=False):
     scheduler = None
     hooks = []
     optimizer_counter = 0
+    negative_embed = None
 
     global_step = training_config.aim_steps
     while True:
@@ -584,8 +553,24 @@ def train_chroma(rank, world_size, debug=False):
             caption = [x if x is not None else "" for x in caption]
             caption = [x.lower() if torch.rand(1).item() < 0.25 else x for x in caption]
             loss_weighting = torch.tensor(loss_weighting, device=rank)
-            if counter % training_config.reset_optim_every == 0:
+            if counter % training_config.change_layer_every == 0:
                 # periodically remove the optimizer and swap it with new one
+
+                # aliasing to make it cleaner
+                o_c = optimizer_counter
+                n_ls = training_config.trained_single_blocks
+                n_ld = training_config.trained_double_blocks
+                trained_layer_keywords = (
+                    [
+                        f"double_blocks.{x}."
+                        for x in trained_double_blocks[o_c * n_ld : o_c * n_ld + n_ld]
+                    ]
+                    + [
+                        f"single_blocks.{x}."
+                        for x in trained_single_blocks[o_c * n_ls : o_c * n_ls + n_ls]
+                    ]
+                    + ["txt_in", "img_in", "final_layer"]
+                )
 
                 # remove hooks and load the new hooks
                 if len(hooks) != 0:
@@ -610,6 +595,8 @@ def train_chroma(rank, world_size, debug=False):
             acc_latents = []
             acc_embeddings = []
             acc_mask = []
+            acc_embeddings_neg = []
+            acc_mask_neg = []
             for mb_i in tqdm(
                 range(
                     dataloader_config.batch_size
@@ -660,6 +647,26 @@ def train_chroma(rank, world_size, debug=False):
                     # flush
                     torch.cuda.empty_cache()
 
+                    # only do this one time to compute negative embeddings
+                    if negative_embed == None:
+                        text_inputs_neg = t5_tokenizer(
+                            [""] * training_config.cache_minibatch,
+                            padding="max_length",
+                            max_length=model_config.t5_max_length,
+                            truncation=True,
+                            return_length=False,
+                            return_overflowing_tokens=False,
+                            return_tensors="pt",
+                        ).to(t5.device)
+
+                        # offload to cpu
+                        t5_embed_neg = t5(text_inputs_neg.input_ids, text_inputs_neg.attention_mask).to(
+                            "cpu", non_blocking=True
+                        )
+                        acc_embeddings_neg.append(t5_embed_neg)
+                        acc_mask_neg.append(text_inputs_neg.attention_mask)
+            
+
             # accumulate the latents and embedding in a variable
             # unload t5 and vae
 
@@ -675,6 +682,10 @@ def train_chroma(rank, world_size, debug=False):
             acc_latents = torch.cat(acc_latents, dim=0)
             acc_embeddings = torch.cat(acc_embeddings, dim=0)
             acc_mask = torch.cat(acc_mask, dim=0)
+
+            # only do this one time to compute negative embeddings
+            if negative_embed == None:
+                negative_embed = (torch.cat(acc_embeddings_neg, dim=0), torch.cat(acc_mask_neg, dim=0))
 
             # process the cache buffer now!
             with torch.no_grad(), torch.autocast(
@@ -716,6 +727,37 @@ def train_chroma(rank, world_size, debug=False):
                 desc=f"minibatch training, Rank {rank}",
                 position=rank,
             ):
+                # CFG distilled target
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    with torch.no_grad():
+                        acc_embeddings_neg, acc_mask_neg = negative_embed
+                        pred_neg = model(
+                            img=noisy_latents[tmb_i * mb : tmb_i * mb + mb].to(
+                                rank, non_blocking=True
+                            ),
+                            img_ids=image_pos_id[tmb_i * mb : tmb_i * mb + mb].to(
+                                rank, non_blocking=True
+                            ),
+                            txt=acc_embeddings_neg[tmb_i * mb : tmb_i * mb + mb].to(
+                                rank, non_blocking=True
+                            ),
+                            txt_ids=text_ids[tmb_i * mb : tmb_i * mb + mb].to(
+                                rank, non_blocking=True
+                            ),
+                            txt_mask=acc_mask_neg[tmb_i * mb : tmb_i * mb + mb].to(
+                                rank, non_blocking=True
+                            ),
+                            timesteps=input_timestep[tmb_i * mb : tmb_i * mb + mb].to(
+                                rank, non_blocking=True
+                            ),
+                            guidance=static_guidance[tmb_i * mb : tmb_i * mb + mb].to(
+                                rank, non_blocking=True
+                            ),
+                        )
+
+                    # target vector for training
+                    target_cfg_vector = pred_neg + training_config.cfg_scale_strength * (target[tmb_i * mb : tmb_i * mb + mb] - pred_neg)
+
                 # do this inside for loops!
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     pred = model(
@@ -744,7 +786,7 @@ def train_chroma(rank, world_size, debug=False):
                     # TODO: need to scale the loss with rank count and grad accum!
 
                     # Compute per-element squared error and mean over sequence and feature dims
-                    loss = ((pred - target[tmb_i * mb : tmb_i * mb + mb]) ** 2).mean(dim=(1, 2))  # Shape: [mb]
+                    loss = ((pred - target_cfg_vector) ** 2).mean(dim=(1, 2))  # Shape: [mb]
 
                     # Normalize per full batch
                     loss = loss / (dataloader_config.batch_size // mb)  # Shape: [mb]
@@ -778,7 +820,7 @@ def train_chroma(rank, world_size, debug=False):
                 if not any(keyword in name for keyword in trained_layer_keywords):
                     if offload_param_count < training_config.offload_param_count:
                         offload_param_count += param.numel()
-                        param.data = param.data.to("cpu", non_blocking=True)
+                        # param.data = param.data.to("cpu", non_blocking=True)
             optimizer_state_to(optimizer, rank)
 
             StochasticAccumulator.reassign_grad_buffer(model)
@@ -786,8 +828,9 @@ def train_chroma(rank, world_size, debug=False):
             if not debug:
                 synchronize_gradients(model)
 
-            optimizer.step()
             scheduler.step()
+
+            optimizer.step()
             optimizer.zero_grad()
 
             if rank == 0:
@@ -799,8 +842,10 @@ def train_chroma(rank, world_size, debug=False):
 
             if (counter + 1) % training_config.save_every == 0 and rank == 0:
                 model_filename = f"{training_config.save_folder}/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pth"
-                save_part(model, trained_layer_keywords, model_filename)
-
+                torch.save(
+                    model.state_dict(),
+                    model_filename,
+                )
                 if training_config.hf_token:
                     upload_to_hf(
                         model_filename,
@@ -951,7 +996,10 @@ def train_chroma(rank, world_size, debug=False):
         # save final model
         if rank == 0:
             model_filename = f"{training_config.save_folder}/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pth"
-            save_part(model, trained_layer_keywords, model_filename)
+            torch.save(
+                model.state_dict(),
+                model_filename,
+            )
             if training_config.hf_token:
                 upload_to_hf(
                     model_filename,

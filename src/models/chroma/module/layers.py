@@ -88,7 +88,7 @@ class RMSNorm(torch.nn.Module):
         #     return self._forward(x)
 
 
-def distribute_modulations(tensor: torch.Tensor):
+def distribute_modulations(tensor: torch.Tensor, depth_single_blocks, depth_double_blocks):
     """
     Distributes slices of the tensor into the block_dict as ModulationOut objects.
 
@@ -102,25 +102,25 @@ def distribute_modulations(tensor: torch.Tensor):
     # HARD CODED VALUES! lookup table for the generated vectors
     # TODO: move this into chroma config!
     # Add 38 single mod blocks
-    for i in range(38):
+    for i in range(depth_single_blocks):
         key = f"single_blocks.{i}.modulation.lin"
         block_dict[key] = None
 
     # Add 19 image double blocks
-    for i in range(19):
+    for i in range(depth_double_blocks):
         key = f"double_blocks.{i}.img_mod.lin"
         block_dict[key] = None
 
     # Add 19 text double blocks
-    for i in range(19):
+    for i in range(depth_double_blocks):
         key = f"double_blocks.{i}.txt_mod.lin"
         block_dict[key] = None
 
     # Add the final layer
     block_dict["final_layer.adaLN_modulation.1"] = None
     # 6.2b version
-    block_dict["lite_double_blocks.4.img_mod.lin"] = None
-    block_dict["lite_double_blocks.4.txt_mod.lin"] = None
+    # block_dict["lite_double_blocks.4.img_mod.lin"] = None
+    # block_dict["lite_double_blocks.4.txt_mod.lin"] = None
 
     idx = 0  # Index to keep track of the vector slices
 

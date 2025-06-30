@@ -1,0 +1,84 @@
+{
+    "training": {
+        "master_seed": 0,
+        "cache_minibatch": 2,
+        "train_minibatch": 1,
+        "offload_param_count": 5000000000,
+        "lr": 1e-05,
+        "weight_decay": 0.0001,
+        "warmup_steps": 1,
+        "change_layer_every": 3,
+        "trained_single_blocks": 2,
+        "trained_double_blocks": 2,
+        "save_every": 6,
+        "save_folder": "testing",
+        "aim_path": "./training",
+        "aim_experiment_name": "base",
+        "aim_hash": null,
+        "aim_steps": 0,
+        "hf_repo_id": null,
+        "hf_token": null,
+        "cfg_scale_strength": 5
+    },
+    "inference": {
+        "inference_every": 2,
+        "inference_folder": "inference_folder",
+        "steps": 20,
+        "guidance": 3,
+        "cfg": 1,
+        "prompts": [
+            "a cute cat sat on a mat while receiving a head pat from his owner called Matt",
+            "baked potato, on the space floating orbiting around the earth"
+        ],
+        "first_n_steps_wo_cfg": -1,
+        "image_dim": [
+            512,
+            512
+        ],
+        "t5_max_length": 512
+    },
+    "extra_inference_config":[
+        {
+            "inference_every": 2,
+            "inference_folder": "inference_folder",
+            "steps": 20,
+            "guidance": 3,
+            "cfg": 4,
+            "prompts": [
+                "a cute cat sat on a mat while receiving a head pat from his owner called Matt",
+                "baked potato, on the space floating orbiting around the earth"
+            ],
+            "first_n_steps_wo_cfg": 0,
+            "image_dim": [
+                512,
+                512
+            ],
+            "t5_max_length": 512
+        }
+    ],
+    "dataloader": {
+        "batch_size": 8,
+        "jsonl_metadata_path": "test_training_data.jsonl",
+        "image_folder_path": "furry_50k_4o/images",
+        "base_resolution": [
+            256
+        ],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "uncond_percentage": 0.0,
+        "resolution_step": 64,
+        "num_workers": 2,
+        "prefetch_factor": 2,
+        "ratio_cutoff": 2.0,
+        "thread_per_worker": 100
+    },
+    "model": {
+        "chroma_path": "models/flux/FLUX.1-schnell/chroma-8.9b.safetensors",
+        "vae_path": "models/flux/ae.safetensors",
+        "t5_path": "models/flux/text_encoder_2",
+        "t5_config_path": "models/flux/text_encoder_2/config.json",
+        "t5_tokenizer_path": "models/flux/tokenizer_2",
+        "t5_to_8bit": true,
+        "t5_max_length": 512
+    }
+}
