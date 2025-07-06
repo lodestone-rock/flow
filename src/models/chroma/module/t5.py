@@ -606,6 +606,7 @@ class T5Stack(nn.Module):
                         if position_bias != None
                         else position_bias
                     ),
+                    use_reentrant=False
                 )
                 pass
             else:
@@ -668,6 +669,7 @@ class T5Stack(nn.Module):
                         if position_bias != None
                         else position_bias
                     ),
+                    use_reentrant=False
                 )
                 pass
             else:
