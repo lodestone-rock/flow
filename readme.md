@@ -8,7 +8,7 @@ A powerful training toolkit for image generation models using Flow Matching tech
 - Flexible configuration via JSON
 - Multi-GPU training support with automatic device detection
 - Configurable inference during training
-- Wandb and Hugging Face integration
+- Aim and Hugging Face integration
 - Parameter efficient training with layer rotation and offloading
 
 ## Installation
@@ -70,10 +70,10 @@ The trainer is configured via a JSON file with the following sections:
     "trained_double_blocks": 2,
     "save_every": 6,
     "save_folder": "checkpoints",
-    "wandb_key": null,
-    "wandb_project": null,
-    "wandb_run": "chroma",
-    "wandb_entity": null,
+    "aim_path": "./training",
+    "aim_experiment_name": "base",
+    "aim_hash": null,
+    "aim_steps": 0,
     "hf_repo_id": null,
     "hf_token": null
 }
@@ -93,10 +93,10 @@ The trainer is configured via a JSON file with the following sections:
 | `trained_double_blocks` | Number of trainable transformer double blocks |
 | `save_every` | Save model checkpoint every X steps |
 | `save_folder` | Directory to save model checkpoints |
-| `wandb_key` | Weights & Biases API key (optional) |
-| `wandb_project` | Weights & Biases project name (optional) |
-| `wandb_run` | Weights & Biases run name (optional) |
-| `wandb_entity` | Weights & Biases entity name (optional) |
+| `aim_path` | Aim directory path (optional, Windows need to install by yourself) |
+| `aim_experiment_name` | Aim experiment name (optional) |
+| `aim_hash` | Aim hash (optional) |
+| `aim_steps` | Aim steps (optional) |
 | `hf_repo_id` | Hugging Face repository ID for pushing models (optional) |
 | `hf_token` | Hugging Face API token (optional) |
 
@@ -243,10 +243,10 @@ You can set up multiple inference configurations to test different settings duri
         "trained_double_blocks": 2,
         "save_every": 6,
         "save_folder": "testing",
-        "wandb_key": null,
-        "wandb_project": null,
-        "wandb_run": "chroma",
-        "wandb_entity": null,
+        "aim_path": "./training",
+        "aim_experiment_name": "base",
+        "aim_hash": null,
+        "aim_steps": 0,
         "hf_repo_id": null,
         "hf_token": null
     },

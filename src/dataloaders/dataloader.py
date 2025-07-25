@@ -7,13 +7,14 @@ import logging
 
 from tqdm import tqdm
 from PIL import Image
+import pillow_avif
+import imageio.v3 as iio
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.v2 as v2
 
 from io import BytesIO
 import concurrent.futures
-import requests
 from requests.exceptions import RequestException, Timeout
 
 from .utils import read_jsonl
@@ -70,7 +71,7 @@ class TextImageDataset(Dataset):
         random.seed(seed)
         # just simple pil image to tensor conversion
         self.image_transforms = v2.Compose(
-            [v2.ToTensor(), v2.Normalize(mean=[0.5], std=[0.5])]
+            [v2.ToImage(), v2.ToDtype(torch.float32, scale=True)]
         )
 
         # TODO: batches has to be preprocessed for batching!!!!
@@ -78,7 +79,6 @@ class TextImageDataset(Dataset):
 
         # slice batches using round robbin
         self._round_robin()
-        self.session = requests.Session()
         self.thread_per_worker = thread_per_worker
         # self.executor = concurrent.futures.ThreadPoolExecutor(thread_per_worker)
 
@@ -225,12 +225,11 @@ class TextImageDataset(Dataset):
 
     # </some utility method here>
 
-    def _load_image(self, sample, session, image_folder_path, timeout):
+    def _load_image(self, sample, image_folder_path, timeout):
         try:
+            img_array = None
             if sample["is_url_based"]:
-                response = session.get(sample["filename"], timeout=timeout)
-                response.raise_for_status()  # Raises an HTTPError if the status code is 4xx/5xx
-                return Image.open(BytesIO(response.content)).convert("RGB")
+                img_array = iio.imread(sample["filename"])
             else:
                 image_path = os.path.join(image_folder_path, sample["filename"])
 
@@ -243,18 +242,40 @@ class TextImageDataset(Dataset):
                     )
                 elif os.path.exists(image_path):
                     # Standard handling if the specified file exists
-                    return Image.open(image_path).convert("RGB")
+                    img_array = iio.imread(image_path)
                 else:
                     # Try alternative extensions if the main file doesn't exist
                     filename, _ = os.path.splitext(sample["filename"])
-                    extensions = ["png", "jpg", "jpeg", "webp"]
+                    extensions = ["png", "jpg", "jpeg", "webp", "bmp", "avif", "tif", "tiff"]
                     for ext in extensions:
                         alt_image_path = os.path.join(
                             image_folder_path, f"{filename}.{ext}"
                         )
                         if os.path.exists(alt_image_path):
-                            return Image.open(alt_image_path).convert("RGB")
-            return None
+                            img_array = iio.imread(alt_image_path)
+            if img_array is None:
+                return None
+            else:
+                if img_array.ndim == 2:
+                    image = Image.fromarray(img_array, mode='L')
+                elif img_array.ndim == 3 or (img_array.ndim == 4):
+                    if img_array.ndim == 4:
+                        # When the image has a frame dimension, only the first frame is taken.
+                        img_array = img_array[0]
+                    height, width, channels = img_array.shape
+                    if channels == 3:  # RGB
+                        image = Image.fromarray(img_array, mode='RGB')
+                    elif channels == 4:  # RGBA
+                        image = Image.fromarray(img_array, mode='RGBA')
+                    else:
+                        raise ValueError(f"Unsupported number of channels: {channels}")
+                else:
+                    raise ValueError(f"Unsupported image shape: {img_array.shape}")
+
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
+                
+                return image
         except Exception as e:
             log.error(
                 f"An error occurred: {e} for {sample['filename']} on rank {self.rank}"
@@ -274,7 +295,6 @@ class TextImageDataset(Dataset):
                 executor.submit(
                     self._load_image,
                     sample,
-                    self.session,
                     self.image_folder_path,
                     self.timeout,
                 )
