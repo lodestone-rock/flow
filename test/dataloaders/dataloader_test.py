@@ -36,7 +36,7 @@ for i in tqdm(range(10)):
     images, caption, index = dataset[i]
     with open(f"preview/{i}.jsonl", 'w') as f:
         for item in caption:
-            json.dump(item, f)  # Dump the item as a JSON object
+            json.dump(item, f, ensure_ascii=False)  # Dump the item as a JSON object
             f.write('\n')  # Write a newline after each JSON object
     save_image(make_grid(images.clip(-1, 1)), f"preview/{i}.jpg", normalize=True)
 

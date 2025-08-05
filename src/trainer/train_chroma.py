@@ -1,3 +1,4 @@
+import platform
 import sys
 import os
 import json
@@ -120,7 +121,11 @@ def setup_distributed(rank, world_size):
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Initialize process group
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    backend = "nccl"  # Default backend for distributed training
+    if platform.system() == "Windows":
+        # Windows does not support NCCL, use GLOO instead
+        backend = "gloo"
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
 
@@ -307,17 +312,17 @@ def cast_linear(module, dtype):
 
 def save_config_to_json(filepath: str, **configs):
     json_data = {key: asdict(value) for key, value in configs.items()}
-    with open(filepath, "w") as json_file:
-        json.dump(json_data, json_file, indent=4)
+    with open(filepath, "w", encoding="utf-8") as json_file:
+        json.dump(json_data, json_file, indent=4, ensure_ascii=False)
 
 
 def dump_dict_to_json(data, file_path):
-    with open(file_path, "w") as json_file:
-        json.dump(data, json_file, indent=4)
+    with open(file_path, "w", encoding="utf-8") as json_file:
+        json.dump(data, json_file, indent=4, ensure_ascii=False)
 
 
 def load_config_from_json(filepath: str):
-    with open(filepath, "r") as json_file:
+    with open(filepath, "r", encoding="utf-8") as json_file:
         return json.load(json_file)
 
 
@@ -768,9 +773,8 @@ def train_chroma(rank, world_size, debug=False):
             if not debug:
                 synchronize_gradients(model)
 
-            scheduler.step()
-
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
 
             if rank == 0:

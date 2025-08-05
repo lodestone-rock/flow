@@ -42,8 +42,12 @@ def _cuda_assignment(C):
     from torch_linear_assignment import batch_linear_assignment
     from torch_linear_assignment import assignment_to_indices
 
-    assignment = batch_linear_assignment(C.unsqueeze(dim=0))
+    original_device = C.device
+    C_cpu = C.cpu().to(torch.float32).unsqueeze(dim=0)
+    assignment = batch_linear_assignment(C_cpu)
     row_indices, col_indices = assignment_to_indices(assignment)
+    row_indices = row_indices.to(original_device)
+    col_indices = col_indices.to(original_device)
     matching_pairs = (row_indices, col_indices)
 
     return C, matching_pairs

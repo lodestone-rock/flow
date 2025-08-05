@@ -689,7 +689,7 @@ class Lumina(nn.Module):
         # refine context
         for layer in self.context_refiner:
             if self.training:
-                cap_feats = ckpt.checkpoint(layer, cap_feats, cap_mask, cap_freqs_cis)
+                cap_feats = ckpt.checkpoint(layer, cap_feats, cap_mask, cap_freqs_cis, use_reentrant=False)
             else:
                 cap_feats = layer(cap_feats, cap_mask, cap_freqs_cis)
 
@@ -718,7 +718,7 @@ class Lumina(nn.Module):
         for layer in self.noise_refiner:
             if self.training:
                 padded_img_embed = ckpt.checkpoint(
-                    layer, padded_img_embed, padded_img_mask, img_freqs_cis, t
+                    layer, padded_img_embed, padded_img_mask, img_freqs_cis, t, use_reentrant=False
                 )
             else:
                 padded_img_embed = layer(
@@ -804,7 +804,7 @@ class Lumina(nn.Module):
 
         for layer in self.layers:
             if self.training:
-                x = ckpt.checkpoint(layer, x, mask, freqs_cis, adaln_input)
+                x = ckpt.checkpoint(layer, x, mask, freqs_cis, adaln_input, use_reentrant=False)
             else:
                 x = layer(x, mask, freqs_cis, adaln_input)
 

@@ -77,7 +77,7 @@ def save_file_multipart(
         index["metadata"].update(metadata)
 
     with open(os.path.join(base_folder, "model.safetensors.index.json"), "w") as f:
-        json.dump(index, f, indent=2)
+        json.dump(index, f, indent=2, ensure_ascii=False)
 
     return num_shards
 
