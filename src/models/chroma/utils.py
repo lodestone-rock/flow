@@ -50,9 +50,25 @@ def vae_unflatten(latents, shape, patch_size=2):
     )
 
 
-def prepare_latent_image_ids(batch_size, height, width, patch_size=2):
+def prepare_latent_image_ids(batch_size, height, width, patch_size=2, max_offset=0):
+    """
+    Generates positional embeddings for a latent image.
+
+    Args:
+        batch_size (int): The number of images in the batch.
+        height (int): The height of the image.
+        width (int): The width of the image.
+        patch_size (int, optional): The size of the patches. Defaults to 2.
+        max_offset (int, optional): The maximum random offset to apply. Defaults to 0.
+
+    Returns:
+        torch.Tensor: A tensor containing the positional embeddings.
+    """
+    # the random pos embedding helps generalize to larger res without training at large res
     # pos embedding for rope, 2d pos embedding, corner embedding and not center based
     latent_image_ids = torch.zeros(height // patch_size, width // patch_size, 3)
+
+    # Add positional encodings
     latent_image_ids[..., 1] = (
         latent_image_ids[..., 1] + torch.arange(height // patch_size)[:, None]
     )
@@ -60,12 +76,21 @@ def prepare_latent_image_ids(batch_size, height, width, patch_size=2):
         latent_image_ids[..., 2] + torch.arange(width // patch_size)[None, :]
     )
 
+    # Add random offset if specified
+    if max_offset > 0:
+        offset_y = torch.randint(0, max_offset + 1, (1,)).item()
+        offset_x = torch.randint(0, max_offset + 1, (1,)).item()
+        latent_image_ids[..., 1] += offset_y
+        latent_image_ids[..., 2] += offset_x
+
+
     (
         latent_image_id_height,
         latent_image_id_width,
         latent_image_id_channels,
     ) = latent_image_ids.shape
 
+    # Reshape for batch
     latent_image_ids = latent_image_ids[None, :].repeat(batch_size, 1, 1, 1)
     latent_image_ids = latent_image_ids.reshape(
         batch_size,

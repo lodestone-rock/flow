@@ -271,24 +271,29 @@ class NerfEmbedder(nn.Module):
         """
         # Get the batch size, number of pixels, and number of channels.
         B, P2, C = inputs.shape
+        # Store the original dtype to cast back to at the end.
+        original_dtype = inputs.dtype
+        # Force all operations within this module to run in fp32.
+        with torch.autocast("cuda", enabled=False):
+            # Infer the patch side length from the number of pixels (P^2).
+            patch_size = int(P2 ** 0.5)
+
+            inputs = inputs.float()
+            # Fetch the pre-computed or cached positional embeddings.
+            dct = self.fetch_pos(patch_size, inputs.device, torch.float32)
+            
+            # Repeat the positional embeddings for each item in the batch.
+            dct = dct.repeat(B, 1, 1)
+            
+            # Concatenate the original input features with the positional embeddings
+            # along the feature dimension.
+            inputs = torch.cat([inputs, dct], dim=-1)
+            
+            # Project the combined tensor to the target hidden size.
+            inputs = self.embedder.float()(inputs)
         
-        # Infer the patch side length from the number of pixels (P^2).
-        patch_size = int(P2 ** 0.5)
-        
-        # Fetch the pre-computed or cached positional embeddings.
-        dct = self.fetch_pos(patch_size, inputs.device, inputs.dtype)
-        
-        # Repeat the positional embeddings for each item in the batch.
-        dct = dct.repeat(B, 1, 1)
-        
-        # Concatenate the original input features with the positional embeddings
-        # along the feature dimension.
-        inputs = torch.cat([inputs, dct], dim=-1)
-        
-        # Project the combined tensor to the target hidden size.
-        inputs = self.embedder(inputs)
-        
-        return inputs
+        return inputs.to(original_dtype)
+
 
 
 class NerfGLUBlock(nn.Module):
