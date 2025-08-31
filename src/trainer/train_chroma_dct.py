@@ -44,6 +44,7 @@ class TrainingConfig:
     master_seed: int
     cache_minibatch: int
     train_minibatch: int
+    updates_per_large_batch: int
     offload_param_count: int
     lr: float
     weight_decay: float
@@ -660,9 +661,17 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
 
             # aliasing
             mb = training_config.train_minibatch
+            
+            # MODIFICATION START
+            # Calculate how many minibatches to process for each parameter update
+            local_num_minibatches = dataloader_config.batch_size // mb // world_size
+            updates_per_large_batch = max(1, training_config.updates_per_large_batch)
+            minibatches_per_update = max(1, local_num_minibatches // updates_per_large_batch)
+            # MODIFICATION END
+
             loss_log = []
             for tmb_i in tqdm(
-                range(dataloader_config.batch_size // mb // world_size),
+                range(local_num_minibatches),
                 desc=f"minibatch training, Rank {rank}",
                 position=rank,
             ):
@@ -718,35 +727,47 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                 loss_log.append(
                     loss.detach().clone() * (dataloader_config.batch_size // mb)
                 )
+
+                # MODIFICATION START
+                # Check if it's time for a parameter update
+                is_update_step = (tmb_i + 1) % minibatches_per_update == 0
+                is_last_minibatch = (tmb_i + 1) == local_num_minibatches
+
+                if is_update_step or is_last_minibatch:
+                    torch.cuda.empty_cache()
+                    offload_param_count = 0
+                    for name, param in model.named_parameters():
+                        if not any(keyword in name for keyword in trained_layer_keywords):
+                            if offload_param_count < training_config.offload_param_count:
+                                offload_param_count += param.numel()
+                                # param.data = param.data.to("cpu", non_blocking=True)
+                    optimizer_state_to(optimizer, rank)
+                    StochasticAccumulator.reassign_grad_buffer(model)
+
+                    if not debug:
+                        synchronize_gradients(model)
+
+                    scheduler.step()
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                    optimizer_state_to(optimizer, "cpu")
+                    torch.cuda.empty_cache()
+                # MODIFICATION END
+
             loss_log = sum(loss_log) / len(loss_log)
             # offload some params to cpu just enough to make room for the caching process
             # and only offload non trainable params
             del acc_embeddings, noisy_images, acc_images
-            torch.cuda.empty_cache()
-            offload_param_count = 0
-            for name, param in model.named_parameters():
-                if not any(keyword in name for keyword in trained_layer_keywords):
-                    if offload_param_count < training_config.offload_param_count:
-                        offload_param_count += param.numel()
-                        # param.data = param.data.to("cpu", non_blocking=True)
-            optimizer_state_to(optimizer, rank)
 
-            StochasticAccumulator.reassign_grad_buffer(model)
-
-            if not debug:
-                synchronize_gradients(model)
-
-            scheduler.step()
-
-            optimizer.step()
-            optimizer.zero_grad()
+            
+            # MODIFICATION START
+            # The original update block was here and has been moved inside the loop.
+            # MODIFICATION END
 
             if rank == 0:
                 run.track(loss_log, name='loss', step=global_step)
                 run.track(training_config.lr, name='learning_rate', step=global_step)
-
-            optimizer_state_to(optimizer, "cpu")
-            torch.cuda.empty_cache()
 
             if (counter + 1) % training_config.save_every == 0 and rank == 0:
                 model_filename = f"{training_config.save_folder}/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pth"
