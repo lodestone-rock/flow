@@ -45,7 +45,8 @@ class TextImageDataset(Dataset):
         num_gpus=1,
         timeout=10,
         thread_per_worker=100,
-        dummy_image=False
+        dummy_image=False,
+        offset=0
     ):
         # coarsened dataset, the batch is handled by the dataset and not the dataloader,
         # increase dataloader prefetch so this thing  run optimally!
@@ -83,6 +84,7 @@ class TextImageDataset(Dataset):
         self.session = requests.Session()
         self.thread_per_worker = thread_per_worker
         # self.executor = concurrent.futures.ThreadPoolExecutor(thread_per_worker)
+        self.batches = self.batches[offset:]
 
     def _load_batches(self):
         batch_size = self.batch_size
