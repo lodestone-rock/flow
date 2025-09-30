@@ -1,5 +1,5 @@
-torch==2.6.0
-torchvision==0.21.0
+torch
+torchvision
 numpy
 matplotlib
 tensorboard
@@ -11,8 +11,8 @@ pillow-jxl-plugin
 transformers
 safetensors
 sentencepiece
-bitsandbytes==0.45.3
+bitsandbytes
 torchastic
-torch-linear-assignment
 huggingface_hub
 scipy
+ramtorch

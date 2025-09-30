@@ -108,66 +108,6 @@ class ModelConfig:
     t5_max_length: int
 
 
-def create_zero_param_groups(param_groups: List[Dict[str, Any]], rank: int, world_size: int) -> Tuple[List[Dict[str, Any]], List[int]]:
-    """
-    Create parameter groups for ZeRO-1 optimizer sharding and generate a map
-    of parameter owners for broadcasting.
-    
-    Args:
-        param_groups: Original parameter groups (list of dicts with 'params' key)
-        rank: Current process rank
-        world_size: Total number of processes
-    
-    Returns:
-        A tuple containing:
-        - List of parameter groups containing only parameters owned by this rank.
-        - A list where the index corresponds to a parameter's global index and
-          the value is the rank of the process that owns it. This is the pre-computed
-          index for the broadcast function.
-    """
-    if not dist.is_initialized():
-        raise RuntimeError("torch.distributed must be initialized")
-    
-    sharded_groups = []
-    owner_ranks = []
-    global_param_idx = 0
-    
-    for group in param_groups:
-        # Copy all group settings except params
-        sharded_group = {k: v for k, v in group.items() if k != 'params'}
-        sharded_group['params'] = []
-        
-        # Add only parameters owned by this rank
-        for param in group['params']:
-            owner_rank = global_param_idx % world_size
-            owner_ranks.append(owner_rank)
-            
-            if owner_rank == rank:
-                sharded_group['params'].append(param)
-            global_param_idx += 1
-        
-        # Only add group if it has parameters for this rank
-        if sharded_group['params']:
-            sharded_groups.append(sharded_group)
-    
-    return sharded_groups, owner_ranks
-
-
-def broadcast_zero_params(all_params: List[torch.Tensor], owner_ranks: List[int]):
-    """
-    Broadcast updated parameters from their owning ranks to all other ranks
-    using a pre-computed index of owner ranks.
-    
-    Args:
-        all_params: List of all model parameters (in the same order across all ranks)
-        owner_ranks: A list mapping each parameter's global index to its owner rank.
-    """
-    with torch.no_grad():
-        for i, param in enumerate(all_params):
-            owner_rank = owner_ranks[i]
-            dist.broadcast(param.data, src=owner_rank)
-
-
 class AdamW(Optimizer):
     r"""
     Arguments:
@@ -414,12 +354,10 @@ def prepare_sot_pairings(images):
 def init_optimizer(model, trained_layer_keywords, lr, wd, warmup_steps, rank, world_size):
     # TODO: pack this into a function
     trained_params = []
-    broadcast_params = []
     for name, param in model.named_parameters():
         if any(keyword in name for keyword in trained_layer_keywords):
             param.requires_grad = True
             trained_params.append((name, param))
-            broadcast_params.append(param)
         else:
             param.requires_grad = False  # Optionally disable grad for others
     # return hooks so it can be released later on
@@ -443,9 +381,9 @@ def init_optimizer(model, trained_layer_keywords, lr, wd, warmup_steps, rank, wo
         },
     ]
     # optimizer only optimize the local shard the we broadcast it later
-    local_shard_param_group, owner_ranks = create_zero_param_groups(param_groups, rank, world_size)
+    shard_param_group = create_zero_param_groups(param_groups, world_size)
     optimizer = AdamW(
-        params=local_shard_param_group,
+        params=shard_param_group[rank],
         lr=lr,
         weight_decay=wd,
         betas=(0.9, 0.999),
@@ -458,7 +396,7 @@ def init_optimizer(model, trained_layer_keywords, lr, wd, warmup_steps, rank, wo
         total_iters=warmup_steps,
     )
 
-    return optimizer, scheduler, hooks, trained_params, owner_ranks, broadcast_params
+    return optimizer, scheduler, hooks, trained_params, shard_param_group
 
 
 def synchronize_gradients(model, scale=1):
@@ -552,9 +490,7 @@ def inference_wrapper(
 
     T5_MAX_LENGTH = t5_max_length
 
-    # store device state of each model
-    # t5_device = t5.device
-    # model_device = model.device
+
     with torch.no_grad():
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             # init random noise
@@ -569,8 +505,6 @@ def inference_wrapper(
 
             timesteps = get_schedule(STEPS, noise.shape[1])
 
-            model.to("cpu")
-            t5.to(rank)  # load t5 to gpu
             text_inputs = t5_tokenizer(
                 PROMPT,
                 padding="max_length",
@@ -600,8 +534,6 @@ def inference_wrapper(
             text_ids = torch.zeros((len(PROMPT), T5_MAX_LENGTH, 3), device=rank)
             neg_text_ids = torch.zeros((len(PROMPT), T5_MAX_LENGTH, 3), device=rank)
 
-            # t5.to("cpu")
-            model.to(rank)  # load model to gpu
             output_image = denoise_cfg(
                 model,
                 noise,
@@ -617,19 +549,6 @@ def inference_wrapper(
                 CFG,
                 FIRST_N_STEPS_WITHOUT_CFG,
             )
-
-            # restore back state
-            model.to("cpu")
-            # t5.to("cpu")
-    del noise
-    del image_pos_id
-    del timesteps
-    del text_inputs
-    del t5_embed
-    del text_inputs_neg
-    del t5_embed_neg
-    del text_ids
-    del neg_text_ids
 
     return output_image
 
@@ -781,7 +700,7 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                 if len(hooks) != 0:
                     hooks = [hook.remove() for hook in hooks]
 
-                optimizer, scheduler, hooks, trained_params, owner_ranks, broadcast_params = init_optimizer(
+                optimizer, scheduler, hooks, trained_params, shard_param_group = init_optimizer(
                     model,
                     trained_layer_keywords,
                     training_config.lr,
@@ -952,7 +871,7 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                         torch.cuda.empty_cache()
                     scheduler.step()
                     optimizer.step()
-                    broadcast_zero_params(broadcast_params, owner_ranks)
+                    broadcast_zero_params(shard_param_group)
                     model.zero_grad()
                     # optimizer.zero_grad()
 
