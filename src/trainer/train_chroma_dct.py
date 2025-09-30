@@ -35,7 +35,7 @@ from src.math_utils import cosine_optimal_transport
 from src.models.chroma.module.t5 import T5EncoderModel, T5Config, replace_keys
 from src.general_utils import load_file_multipart, load_selected_keys, load_safetensors
 import src.lora_and_quant as lora_and_quant
-
+from ramtorch.zero1 import broadcast_zero_params, create_zero_param_groups
 from huggingface_hub import HfApi, upload_file
 import time
 
