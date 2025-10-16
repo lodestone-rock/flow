@@ -43,6 +43,7 @@ from aim import Run, Image as AimImage
 from datetime import datetime
 from PIL import Image as PILImage
 
+
 @dataclass
 class TrainingConfig:
     master_seed: int
@@ -150,18 +151,21 @@ class AdamW(Optimizer):
             centralization=centralization,
         )
         super(AdamW, self).__init__(params, defaults)
-        
+
         self.chunk_size = chunk_size
 
         # Initialize state in pinned memory for faster async transfers
         for group in self.param_groups:
-            for p in group['params']:
+            for p in group["params"]:
                 state = self.state[p]
                 if not state:
                     state["step"] = 0
-                    state["ema"] = torch.zeros_like(p.data, dtype=torch.bfloat16, device='cpu').pin_memory()
-                    state["ema_squared"] = torch.zeros_like(p.data, dtype=torch.bfloat16, device='cpu').pin_memory()
-
+                    state["ema"] = torch.zeros_like(
+                        p.data, dtype=torch.bfloat16, device="cpu"
+                    ).pin_memory()
+                    state["ema_squared"] = torch.zeros_like(
+                        p.data, dtype=torch.bfloat16, device="cpu"
+                    ).pin_memory()
 
     def step(self, closure=None):
         loss = None
@@ -173,7 +177,7 @@ class AdamW(Optimizer):
             for i, p in enumerate(group["params"]):
                 if p.grad is None:
                     continue
-                
+
                 assert p.dtype == torch.bfloat16, "only bfloat 16 is supported."
                 grad = p.grad
                 if grad.is_sparse:
@@ -185,11 +189,15 @@ class AdamW(Optimizer):
                 # Lazy state initialization
                 if not state:
                     state["step"] = 0
-                    state["ema"] = torch.zeros_like(p.data, dtype=torch.bfloat16, device='cpu').pin_memory()
-                    state["ema_squared"] = torch.zeros_like(p.data, dtype=torch.bfloat16, device='cpu').pin_memory()
+                    state["ema"] = torch.zeros_like(
+                        p.data, dtype=torch.bfloat16, device="cpu"
+                    ).pin_memory()
+                    state["ema_squared"] = torch.zeros_like(
+                        p.data, dtype=torch.bfloat16, device="cpu"
+                    ).pin_memory()
 
                 # ========= Asynchronously queue all operations for this parameter =========
-                
+
                 # 1. Queue Host-to-Device copy
                 ema_gpu = state["ema"].to(device, non_blocking=True)
                 ema_squared_gpu = state["ema_squared"].to(device, non_blocking=True)
@@ -219,8 +227,10 @@ class AdamW(Optimizer):
 
                 ema_fp32.mul_(beta1).add_(grad, alpha=1 - beta1)
                 ema_squared_fp32.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                
-                denom = (ema_squared_fp32.sqrt() / bias_correction_sqrt).add_(group["eps"])
+
+                denom = (ema_squared_fp32.sqrt() / bias_correction_sqrt).add_(
+                    group["eps"]
+                )
 
                 if weight_decay != 0:
                     p_fp32.data.mul_(1 - step_size * weight_decay)
@@ -230,11 +240,11 @@ class AdamW(Optimizer):
                 copy_stochastic_(p, p_fp32)
                 copy_stochastic_(ema_gpu, ema_fp32)
                 copy_stochastic_(ema_squared_gpu, ema_squared_fp32)
-                
+
                 # 3. Queue Device-to-Host copy
                 state["ema"].copy_(ema_gpu, non_blocking=True)
                 state["ema_squared"].copy_(ema_squared_gpu, non_blocking=True)
-                
+
                 # ========= Check if we need to synchronize =========
                 # We synchronize after processing a chunk of parameters.
                 # The (i + 1) ensures we sync after the 1st, 2nd, ... chunk.
@@ -246,7 +256,8 @@ class AdamW(Optimizer):
             torch.cuda.synchronize()
 
         return loss
-    
+
+
 def setup_distributed(rank, world_size):
     """Initialize distributed training"""
     os.environ["MASTER_ADDR"] = "localhost"
@@ -325,9 +336,7 @@ def prepare_sot_pairings(images):
     # )
     num_points = 1000  # Number of points in the range
     x, probabilities = create_distribution(num_points, device=images.device)
-    input_timestep = sample_from_distribution(
-        x, probabilities, n, device=images.device
-    )
+    input_timestep = sample_from_distribution(x, probabilities, n, device=images.device)
 
     # biasing towards earlier more noisy steps where it's the most uncertain
     # input_timestep = time_shift(0.5, 1, input_timestep)
@@ -351,7 +360,9 @@ def prepare_sot_pairings(images):
     return noisy_images, target, input_timestep, image_pos_id, images.shape
 
 
-def init_optimizer(model, trained_layer_keywords, lr, wd, warmup_steps, rank, world_size):
+def init_optimizer(
+    model, trained_layer_keywords, lr, wd, warmup_steps, rank, world_size
+):
     # TODO: pack this into a function
     trained_params = []
     for name, param in model.named_parameters():
@@ -490,15 +501,14 @@ def inference_wrapper(
 
     T5_MAX_LENGTH = t5_max_length
 
-
     with torch.no_grad():
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             # init random noise
             noise = torch.randn(
-                [len(PROMPT), 3, WIDTH, HEIGHT], 
-                device=rank, 
-                dtype=torch.bfloat16, 
-                generator=torch.Generator(device=rank).manual_seed(seed)
+                [len(PROMPT), 3, WIDTH, HEIGHT],
+                device=rank,
+                dtype=torch.bfloat16,
+                generator=torch.Generator(device=rank).manual_seed(seed),
             )
             n, c, h, w = noise.shape
             image_pos_id = prepare_latent_image_ids(n, h, w, patch_size=16).to(rank)
@@ -518,7 +528,7 @@ def inference_wrapper(
             t5_embed = t5(text_inputs.input_ids, text_inputs.attention_mask).to(rank)
 
             text_inputs_neg = t5_tokenizer(
-                [""]*len(PROMPT),
+                [""] * len(PROMPT),
                 padding="max_length",
                 max_length=T5_MAX_LENGTH,
                 truncation=True,
@@ -527,9 +537,9 @@ def inference_wrapper(
                 return_tensors="pt",
             ).to(t5.device)
 
-            t5_embed_neg = t5(text_inputs_neg.input_ids, text_inputs_neg.attention_mask).to(
-                rank
-            )
+            t5_embed_neg = t5(
+                text_inputs_neg.input_ids, text_inputs_neg.attention_mask
+            ).to(rank)
 
             text_ids = torch.zeros((len(PROMPT), T5_MAX_LENGTH, 3), device=rank)
             neg_text_ids = torch.zeros((len(PROMPT), T5_MAX_LENGTH, 3), device=rank)
@@ -568,16 +578,19 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
         InferenceConfig(**conf) for conf in config_data["extra_inference_config"]
     ]
 
-
     # Setup Aim run
     if training_config.aim_path is not None and rank == 0:
         # current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        run = Run(repo=training_config.aim_path, run_hash=training_config.aim_hash, experiment=training_config.aim_experiment_name, force_resume=True)
+        run = Run(
+            repo=training_config.aim_path,
+            run_hash=training_config.aim_hash,
+            experiment=training_config.aim_experiment_name,
+            force_resume=True,
+        )
 
         hparams = config_data.copy()
-        hparams["training"]['aim_path'] = None
+        hparams["training"]["aim_path"] = None
         run["hparams"] = hparams
-
 
     os.makedirs(training_config.save_folder, exist_ok=True)
     # paste the training config for this run
@@ -598,10 +611,16 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
             model = Chroma(chroma_params)
 
         # Check file extension to determine loading method
-        if model_config.chroma_path.endswith('.safetensors') or model_config.chroma_path.endswith('.sft'):
-            model.load_state_dict(load_safetensors(model_config.chroma_path), assign=True)
+        if model_config.chroma_path.endswith(
+            ".safetensors"
+        ) or model_config.chroma_path.endswith(".sft"):
+            model.load_state_dict(
+                load_safetensors(model_config.chroma_path), assign=True
+            )
         else:  # Assume PyTorch format (.pth)
-            model.load_state_dict(torch.load(model_config.chroma_path, map_location="cpu"), assign=True)
+            model.load_state_dict(
+                torch.load(model_config.chroma_path, map_location="cpu"), assign=True
+            )
 
         # model.load_state_dict(load_safetensors(model_config.chroma_path), assign=True)
 
@@ -643,7 +662,7 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
         rank=rank,
         num_gpus=world_size,
         ratio_cutoff=dataloader_config.ratio_cutoff,
-        offset=dataloader_config.offset
+        offset=dataloader_config.offset,
     )
 
     optimizer = None
@@ -700,14 +719,16 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                 if len(hooks) != 0:
                     hooks = [hook.remove() for hook in hooks]
 
-                optimizer, scheduler, hooks, trained_params, shard_param_group = init_optimizer(
-                    model,
-                    trained_layer_keywords,
-                    training_config.lr,
-                    training_config.weight_decay,
-                    training_config.warmup_steps,
-                    rank,
-                    world_size
+                optimizer, scheduler, hooks, trained_params, shard_param_group = (
+                    init_optimizer(
+                        model,
+                        trained_layer_keywords,
+                        training_config.lr,
+                        training_config.weight_decay,
+                        training_config.warmup_steps,
+                        rank,
+                        world_size,
+                    )
                 )
 
                 optimizer_counter += 1
@@ -717,7 +738,7 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
 
             # The full-size image tensor remains in CPU memory
             acc_images = images
-            
+
             # process the full batch now!
             with torch.no_grad(), torch.autocast(
                 device_type="cuda", dtype=torch.bfloat16
@@ -740,9 +761,7 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                 # NOTE:
                 # using static guidance 1 for now
                 # this should be disabled later on !
-                static_guidance = torch.tensor(
-                    [0.0] * acc_images.shape[0], device=rank
-                )
+                static_guidance = torch.tensor([0.0] * acc_images.shape[0], device=rank)
 
             # set the input to requires grad to make autograd works
             noisy_images.requires_grad_(True)
@@ -752,12 +771,14 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
 
             # aliasing
             mb = training_config.train_minibatch
-            
+
             # MODIFICATION START
             # Calculate how many minibatches to process for each parameter update
             local_num_minibatches = dataloader_config.batch_size // mb // world_size
             updates_per_large_batch = max(1, training_config.updates_per_large_batch)
-            minibatches_per_update = max(1, local_num_minibatches // updates_per_large_batch)
+            minibatches_per_update = max(
+                1, local_num_minibatches // updates_per_large_batch
+            )
 
             # move model to device before the minibatching loop
             model.to(rank)
@@ -770,7 +791,9 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                 position=rank,
             ):
                 # MODIFICATION START: T5 computation is now inside the minibatch loop
-                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with torch.no_grad(), torch.autocast(
+                    device_type="cuda", dtype=torch.bfloat16
+                ):
                     # 1. Move T5 to GPU for this minibatch
                     t5.to(rank)
 
@@ -787,8 +810,10 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                         return_overflowing_tokens=False,
                         return_tensors="pt",
                     ).to(rank)
-                    
-                    minibatch_embeddings = t5(text_inputs.input_ids, text_inputs.attention_mask)
+
+                    minibatch_embeddings = t5(
+                        text_inputs.input_ids, text_inputs.attention_mask
+                    )
                     minibatch_mask = text_inputs.attention_mask
 
                     # 4. Move T5 back to CPU to free VRAM for the main model
@@ -820,13 +845,17 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                     # TODO: need to scale the loss with rank count and grad accum!
 
                     # Compute per-element squared error and mean over sequence and feature dims
-                    loss = ((pred - target[tmb_i * mb : tmb_i * mb + mb]) ** 2).mean(dim=(1, 2, 3))  # Shape: [mb]
+                    loss = ((pred - target[tmb_i * mb : tmb_i * mb + mb]) ** 2).mean(
+                        dim=(1, 2, 3)
+                    )  # Shape: [mb]
 
                     # Normalize per full batch
                     loss = loss / (dataloader_config.batch_size // mb)  # Shape: [mb]
 
                     # Apply per-sample weight
-                    weights = loss_weighting[tmb_i * mb : tmb_i * mb + mb]  # Shape: [mb]
+                    weights = loss_weighting[
+                        tmb_i * mb : tmb_i * mb + mb
+                    ]  # Shape: [mb]
 
                     # Normalize weights to ensure the overall loss scale is consistent
                     weights = weights / weights.sum()
@@ -845,9 +874,7 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                 #     loss.detach().clone() * (dataloader_config.batch_size // mb)
                 # )
                 loss.backward()
-                loss_log.append(
-                    loss.item() * (dataloader_config.batch_size // mb)
-                )
+                loss_log.append(loss.item() * (dataloader_config.batch_size // mb))
 
                 # MODIFICATION START
                 # Check if it's time for a parameter update
@@ -885,7 +912,6 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
             # and only offload non trainable params
             del noisy_images, target, input_timestep, image_pos_id, acc_images
 
-            
             # MODIFICATION START
             # The original update block was here and has been moved inside the loop.
             # MODIFICATION END
@@ -897,11 +923,13 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                     final_loss_value = sum(loss_log) / len(loss_log)
                     # if you need it as a tensor for tracking:
                     loss_log_tensor = torch.tensor(final_loss_value, device=rank)
-                    run.track(loss_log_tensor, name='loss', step=global_step)
-                    run.track(training_config.lr, name='learning_rate', step=global_step)
+                    run.track(loss_log_tensor, name="loss", step=global_step)
+                    run.track(
+                        training_config.lr, name="learning_rate", step=global_step
+                    )
 
             dataloader_config.offset += 1
-            
+
             if (counter + 1) % training_config.save_every == 0 and rank == 0:
                 model.to("cpu")
                 model_filename = f"{training_config.save_folder}/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pth"
@@ -929,12 +957,14 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
             if (counter + 1) % inference_config.inference_every == 0:
                 # Part 1: Each rank generates and saves its own images and prompts to temporary files.
                 # A temporary subdirectory is used to avoid clutter and simplify cleanup.
-                temp_inference_folder = os.path.join(inference_config.inference_folder, f"step_{counter}_temp")
+                temp_inference_folder = os.path.join(
+                    inference_config.inference_folder, f"step_{counter}_temp"
+                )
                 os.makedirs(temp_inference_folder, exist_ok=True)
 
                 # Each rank gets its own unique prompt from its current batch data
                 preview_prompts_this_rank = inference_config.prompts + caption[:1]
-                
+
                 # Combine the main inference config with any extra ones
                 all_inference_configs = [inference_config] + extra_inference_config
 
@@ -945,7 +975,8 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                         model=model,
                         t5_tokenizer=t5_tokenizer,
                         t5=t5,
-                        seed=training_config.master_seed + rank,  # Seed ensures different images per rank
+                        seed=training_config.master_seed
+                        + rank,  # Seed ensures different images per rank
                         steps=current_config.steps,
                         guidance=current_config.guidance,
                         cfg=current_config.cfg,
@@ -959,16 +990,28 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                     # Loop through the generated images and prompts to save them individually
                     for prompt_idx, prompt in enumerate(preview_prompts_this_rank):
                         # Define unique filenames for the image and its prompt
-                        base_filename = f"config{config_idx}_prompt{prompt_idx}_rank{rank}"
-                        img_path = os.path.join(temp_inference_folder, f"{base_filename}.jpg")
-                        prompt_path = os.path.join(temp_inference_folder, f"{base_filename}.txt")
+                        base_filename = (
+                            f"config{config_idx}_prompt{prompt_idx}_rank{rank}"
+                        )
+                        img_path = os.path.join(
+                            temp_inference_folder, f"{base_filename}.jpg"
+                        )
+                        prompt_path = os.path.join(
+                            temp_inference_folder, f"{base_filename}.txt"
+                        )
 
                         # Save the specific image from the tensor batch
-                        save_image(images_tensor[prompt_idx:prompt_idx+1].clamp(-1, 1).add(1).div(2), img_path)
-                        with open(prompt_path, 'w') as f:
+                        save_image(
+                            images_tensor[prompt_idx : prompt_idx + 1]
+                            .clamp(-1, 1)
+                            .add(1)
+                            .div(2),
+                            img_path,
+                        )
+                        with open(prompt_path, "w") as f:
                             f.write(prompt)
                 # MODIFICATION END
-                
+
                 # Clean up the tensor to free VRAM on each rank
                 del images_tensor
                 torch.cuda.empty_cache()
@@ -986,10 +1029,18 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
 
                     # Discover all generated files by looking for the prompt text files
                     # Sorting ensures a consistent order when building the grid
-                    prompt_files = sorted([f for f in os.listdir(temp_inference_folder) if f.endswith('.txt')])
-                    
+                    prompt_files = sorted(
+                        [
+                            f
+                            for f in os.listdir(temp_inference_folder)
+                            if f.endswith(".txt")
+                        ]
+                    )
+
                     for filename in prompt_files:
-                        img_path = os.path.join(temp_inference_folder, filename.replace('.txt', '.jpg'))
+                        img_path = os.path.join(
+                            temp_inference_folder, filename.replace(".txt", ".jpg")
+                        )
                         prompt_path = os.path.join(temp_inference_folder, filename)
 
                         if os.path.exists(img_path):
@@ -1000,31 +1051,35 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
                             all_images_for_grid.append(img_tensor)
 
                             # Read the corresponding prompt
-                            with open(prompt_path, 'r') as f:
+                            with open(prompt_path, "r") as f:
                                 all_prompts_for_caption.append(f.read())
-                    
+
                     if all_images_for_grid:
                         # Create a single grid from all collected images
                         # Adjust nrow to control the layout of the grid
-                        final_grid = make_grid(all_images_for_grid, nrow=world_size, normalize=False)
+                        final_grid = make_grid(
+                            all_images_for_grid, nrow=world_size, normalize=False
+                        )
 
                         # Save the combined grid to its final destination
-                        final_image_path = os.path.join(inference_config.inference_folder, f"{counter}.jpg")
+                        final_image_path = os.path.join(
+                            inference_config.inference_folder, f"{counter}.jpg"
+                        )
                         save_image(final_grid, final_image_path)
                         print(f"Combined image grid saved to {final_image_path}")
-                        
+
                         # Track the final collaged image and its combined caption with Aim
                         final_pil_image = PILImage.open(final_image_path)
                         combined_caption = "\n---\n".join(all_prompts_for_caption)
                         aim_img = AimImage(final_pil_image, caption=combined_caption)
-                        run.track(aim_img, name='example_image', step=global_step)
-                        
+                        run.track(aim_img, name="example_image", step=global_step)
+
                         # Clean up memory
                         del final_grid
                         del final_pil_image
                         del aim_img
                         del all_images_for_grid
-                    
+
                     # Clean up the temporary directory now that its contents are processed
                     shutil.rmtree(temp_inference_folder)
 
@@ -1036,7 +1091,6 @@ def train_chroma(rank, world_size, debug=False, json_config="training_config.jso
             # flush
             acc_embeddings = []
             global_step += 1
-            
 
         # save final model
         if rank == 0:
