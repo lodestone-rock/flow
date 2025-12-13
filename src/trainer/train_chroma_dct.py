@@ -110,6 +110,8 @@ class ModelConfig:
     t5_tokenizer_path: str
     t5_to_8bit: bool
     t5_max_length: int
+    use_x0: bool = False
+    use_patch_size_32: bool = False
 
 
 def setup_distributed(rank, world_size):
@@ -177,12 +179,15 @@ def sample_from_distribution(x, probabilities, num_samples, device=None):
     return sampled_values
 
 
-def prepare_sot_pairings(images):
+def prepare_sot_pairings(images, is_x0_v=False, is_patch_size_32=False):
     # stochastic optimal transport pairings
     # just use mean because STD is so small and practically negligible
     images = images.to(torch.float32)
     n, c, h, w = images.shape
-    image_pos_id = prepare_latent_image_ids(n, h, w, patch_size=16)
+    patch_size_multiplier = 2 if is_patch_size_32 else 1
+    image_pos_id = prepare_latent_image_ids(
+        n, h, w, patch_size=16 * patch_size_multiplier
+    )
 
     # randomize ode timesteps
     # input_timestep = torch.round(
@@ -209,7 +214,13 @@ def prepare_sot_pairings(images):
     noisy_images = images * (1 - timesteps) + noise * timesteps
 
     # target vector that being regressed on
-    target = noise - images
+    if is_x0_v:
+        # this is equivalent to target = noise - images
+        # but since there's singularity we just shift the target up a bit
+        # and the model also doing shifted prediction
+        target = (noisy_images - images) / (timesteps + 5e-2)
+    else:
+        target = noise - images
 
     return noisy_images, target, input_timestep, image_pos_id, images.shape
 
@@ -253,7 +264,7 @@ def init_optimizer(
         lr=lr,
         weight_decay=wd,
         betas=(0.9, 0.999),
-        dtype=torch.float32
+        dtype=torch.float32,
     )
 
     scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -331,6 +342,7 @@ def inference_wrapper(
     first_n_steps_wo_cfg: int,
     image_dim=(512, 512),
     t5_max_length=512,
+    is_patch_size_32=False,
 ):
     #############################################################################
     # test inference
@@ -346,7 +358,7 @@ def inference_wrapper(
     PROMPT = prompts
 
     T5_MAX_LENGTH = t5_max_length
-
+    model.eval()
     with torch.no_grad():
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             # init random noise
@@ -357,7 +369,10 @@ def inference_wrapper(
                 generator=torch.Generator(device=rank).manual_seed(seed),
             )
             n, c, h, w = noise.shape
-            image_pos_id = prepare_latent_image_ids(n, h, w, patch_size=16).to(rank)
+            patch_size_multiplier = 2 if is_patch_size_32 else 1
+            image_pos_id = prepare_latent_image_ids(
+                n, h, w, patch_size=16 * patch_size_multiplier
+            ).to(rank)
 
             timesteps = get_schedule(STEPS, noise.shape[1])
 
@@ -405,7 +420,7 @@ def inference_wrapper(
                 CFG,
                 FIRST_N_STEPS_WITHOUT_CFG,
             )
-
+    model.train()
     return output_image
 
 
@@ -435,6 +450,7 @@ def train_chroma(rank, world_size, wrap_models, wrap_config, debug=False):
 
     t5.to(rank)
     model.to(rank)
+    model.train()
 
     # Setup Aim run
     if training_config.aim_path is not None and rank == 0:
@@ -518,6 +534,7 @@ def train_chroma(rank, world_size, wrap_models, wrap_config, debug=False):
         while True:
             training_config.master_seed += 1
             torch.manual_seed(training_config.master_seed)
+            model.train()
 
             dataloader = DataLoader(
                 dataset,
@@ -561,7 +578,11 @@ def train_chroma(rank, world_size, wrap_models, wrap_config, debug=False):
                         input_timestep,
                         image_pos_id,
                         latent_shape,
-                    ) = prepare_sot_pairings(acc_images.to(rank))
+                    ) = prepare_sot_pairings(
+                        acc_images.to(rank),
+                        model_config.use_x0,
+                        model_config.use_patch_size_32,
+                    )
                     noisy_images = noisy_images  # .to(torch.bfloat16)
                     target = target  # .to(torch.bfloat16)
                     input_timestep = input_timestep  # .to(torch.bfloat16)
@@ -600,6 +621,7 @@ def train_chroma(rank, world_size, wrap_models, wrap_config, debug=False):
                     desc=f"minibatch training, Rank {rank}",
                     position=rank,
                 ):
+                    model.train()
                     with torch.no_grad(), torch.autocast(
                         device_type="cuda", dtype=torch.bfloat16
                     ):
@@ -770,6 +792,7 @@ def train_chroma(rank, world_size, wrap_models, wrap_config, debug=False):
                             first_n_steps_wo_cfg=current_config.first_n_steps_wo_cfg,
                             image_dim=current_config.image_dim,
                             t5_max_length=current_config.t5_max_length,
+                            is_patch_size_32=model_config.use_patch_size_32,
                         )
 
                         # Loop through the generated images and prompts to save them individually
@@ -931,6 +954,10 @@ def main(config="training_config_dct.json"):
     with torch.no_grad():
         # load chroma and enable grad
         chroma_params._use_compiled = True
+        chroma_params.use_x0 = model_config.use_x0
+        chroma_params.use_patch_size_32 = model_config.use_patch_size_32
+        print(model_config.use_x0)
+        print(model_config.use_patch_size_32)
         with torch.device("meta"):
             model = Chroma(chroma_params)
 
@@ -938,14 +965,22 @@ def main(config="training_config_dct.json"):
         if model_config.chroma_path.endswith(
             ".safetensors"
         ) or model_config.chroma_path.endswith(".sft"):
-            model.load_state_dict(
-                load_safetensors(model_config.chroma_path), assign=True
-            )
+            state_dict = load_safetensors(model_config.chroma_path)
+
         else:  # Assume PyTorch format (.pth)
-            model.load_state_dict(
-                torch.load(model_config.chroma_path, map_location="cpu"), assign=True
-            )
-        
+            state_dict = torch.load(model_config.chroma_path, map_location="cpu")
+
+        if model_config.use_x0:
+            print("using x0")
+
+            state_dict["__x0__"] = torch.tensor([])
+
+        if model_config.use_patch_size_32:
+            print("Using patch size 32 mode")
+            state_dict["__32x32__"] = torch.tensor([])
+
+        model.load_state_dict(state_dict, assign=True)
+
         model = replace_linear_with_ramtorch(model)
 
         print("chroma loaded")

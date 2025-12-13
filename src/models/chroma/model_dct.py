@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 import torch.utils.checkpoint as ckpt
+import torch.nn.functional as F
 
 from .module.layers import (
     DoubleStreamBlock,
@@ -41,6 +42,8 @@ class ChromaParams:
     nerf_depth: int
     nerf_max_freqs: int
     _use_compiled: bool
+    use_x0: bool
+    use_patch_size_32: bool
 
 
 chroma_params = ChromaParams(
@@ -64,6 +67,8 @@ chroma_params = ChromaParams(
     nerf_depth=4,
     nerf_max_freqs=8,
     _use_compiled=False,
+    use_x0=False,
+    use_patch_size_32=False
 )
 
 
@@ -217,12 +222,21 @@ class Chroma(nn.Module):
         )
         self.approximator_in_dim = params.approximator_in_dim
 
+        if params.use_x0:
+            print("the model is using x0 prediction")
+            self.register_buffer("__x0__", torch.tensor([]))
+
+        if params.use_patch_size_32:
+            print("the model is using patch size 32 prediction")
+            self.register_buffer("__32x32__", torch.tensor([]))
+            self.params.patch_size *= 2
+
     @property
     def device(self):
         # Get the device of the module (assumes all parameters are on the same device)
         return next(self.parameters()).device
 
-    def forward(
+    def _forward(
         self,
         img: Tensor,
         img_ids: Tensor,
@@ -246,6 +260,9 @@ class Chroma(nn.Module):
         nerf_pixels = nerf_pixels.transpose(1, 2) # -> [B, NumPatches, C * P * P]
         
         # partchify ops
+        if hasattr(self, "__32x32__"):
+            img = F.interpolate(img, size=(H//2, W//2), mode="nearest")
+
         img = self.img_in_patch(img) # -> [B, Hidden, H/P, W/P]
         num_patches = img.shape[2] * img.shape[3]
         # flatten into a sequence for the transformer.
@@ -372,3 +389,38 @@ class Chroma(nn.Module):
         img_dct = self.nerf_final_layer_conv.conv(img_dct)
 
         return img_dct
+
+    def _apply_x0_residual(self, predicted, noisy, timesteps):
+
+        # non zero during training to prevent 0 div
+        eps = 5e-2 if self.training else 0.0
+        return (noisy - predicted) / (timesteps.view(-1,1,1,1) + eps)
+
+
+    def forward(
+        self,
+        img: Tensor,
+        img_ids: Tensor,
+        txt: Tensor,
+        txt_ids: Tensor,
+        txt_mask: Tensor,
+        timesteps: Tensor,
+        guidance: Tensor,
+        attn_padding: int = 1,
+    ):
+        out = self._forward(
+            img=img,
+            img_ids=img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            txt_mask=txt_mask,
+            timesteps=timesteps,
+            guidance=guidance,
+            attn_padding=attn_padding,
+        )
+
+        # If x0 variant → v-pred, just return this instead
+        if hasattr(self, "__x0__"):
+            return self._apply_x0_residual(out, img, timesteps)
+
+        return out
