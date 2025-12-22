@@ -77,25 +77,24 @@ def denoise_cfg(
     neg_txt_mask: Tensor,
     # sampling parameters
     timesteps: list[float],
-    guidance: float = 4.0,
     cfg: float = 2.0,
     first_n_steps_without_cfg: int = 4,
 ):
-    # this is ignored for schnell
-    guidance_vec = torch.full(
-        (img.shape[0],), guidance, device=img.device, dtype=img.dtype
-    )
     step_count = 0
+
+    # full attention and no masked region for t2i task
+    img_mask = torch.ones(img.shape[:2], device=img.device).bool()
+
     for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
         t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
         pred = model(
             img=img,
             img_ids=img_ids,
+            img_mask=img_mask,
             txt=txt,
             txt_ids=txt_ids,
             txt_mask=txt_mask,
             timesteps=t_vec,
-            guidance=guidance_vec,
         )
         # disable cfg for x steps before using cfg
         if step_count < first_n_steps_without_cfg or first_n_steps_without_cfg == -1:
@@ -104,11 +103,11 @@ def denoise_cfg(
             pred_neg = model(
                 img=img,
                 img_ids=img_ids,
+                img_mask=img_mask,
                 txt=neg_txt,
                 txt_ids=neg_txt_ids,
                 txt_mask=neg_txt_mask,
                 timesteps=t_vec,
-                guidance=guidance_vec,
             )
 
             pred_cfg = pred_neg + (pred - pred_neg) * cfg
