@@ -8,13 +8,13 @@ import torch.nn.functional as F
 def vae_flatten(latents, patch_size=2):
     # nchw to nhwc then pixel shuffle 2 then flatten
     # n c h w -> n h w c
-    # n (h dh) (w dw) c -> n h w (c dh dw)
+    # n (h dh) (w dw) c -> n h w (dh dw c)
     # n h w c -> n (h w) c
     # n, c, h, w = latents.shape
     return (
         rearrange(
             latents,
-            "n c (h dh) (w dw) -> n (h w) (c dh dw)",
+            "n c (h dh) (w dw) -> n (h w) (dh dw c)",
             dh=patch_size,
             dw=patch_size,
         ),
@@ -23,11 +23,12 @@ def vae_flatten(latents, patch_size=2):
 
 
 def vae_unflatten(latents, shape, patch_size=2):
-    # reverse of that operator above
     n, c, h, w = shape
+    # The input latents have shape [N, SeqLen, Dim]
+    # The Dim is packed as (dh dw c) because patchify put C at the end.
     return rearrange(
         latents,
-        "n (h w) (c dh dw) -> n c (h dh) (w dw)",
+        "n (h w) (dh dw c) -> n c (h dh) (w dw)",
         dh=patch_size,
         dw=patch_size,
         c=c,
@@ -94,7 +95,21 @@ def prepare_latent_image_ids(start_indices, height, width, patch_size=2, max_off
         latent_image_id_channels,
     )
 
-    return latent_image_ids
+    return latent_image_ids.int()
+
+
+def make_text_position_ids(valid_len, max_sequence_length, extra_padding=0):
+    # will return [this dim increment then repeat, 0, 0]
+    device = valid_len.device
+    valid_len += extra_padding
+    B = valid_len.shape[0]
+    seq = torch.arange(1, max_sequence_length + 1, device=device)  # [L]
+    seq = seq.unsqueeze(0).expand(B, max_sequence_length)  # [B, L]
+
+    increment_then_repeat = torch.minimum(seq, valid_len.unsqueeze(1))
+    pos_ids = torch.zeros((B, max_sequence_length, 3), device=device)  # [B, L, D]
+    pos_ids[:, :, 0] = increment_then_repeat
+    return pos_ids.int()
 
 
 print()

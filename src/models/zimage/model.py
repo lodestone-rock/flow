@@ -10,6 +10,9 @@ from torch.nn.utils.rnn import pad_sequence
 from torch import Tensor, nn
 from dataclasses import dataclass
 from typing import Tuple
+import torch.utils.checkpoint as ckpt
+from einops import rearrange
+
 
 @dataclass
 class ZImageParams:
@@ -342,7 +345,8 @@ class RopeEmbedder:
             return freqs_cis
 
     def __call__(self, ids: torch.Tensor):
-        assert ids.ndim == 2
+        # Modified: Allow 2D [Seq, Axes] or 3D [Batch, Seq, Axes]
+        assert ids.ndim >= 2
         assert ids.shape[-1] == len(self.axes_dims)
         device = ids.device
 
@@ -357,8 +361,18 @@ class RopeEmbedder:
 
         result = []
         for i in range(len(self.axes_dims)):
-            index = ids[:, i]
+            # Modified: Use '...' to select the column for the specific axis
+            # regardless of batch dimensions.
+            # If ids is [B, S, 3], index becomes [B, S].
+            # If ids is [S, 3], index becomes [S].
+            index = ids[..., i]
+
+            # PyTorch advanced indexing:
+            # table: [MaxLen, Dim]
+            # index: [B, S]
+            # output: [B, S, Dim]
             result.append(self.freqs_cis[i][index])
+
         return torch.cat(result, dim=-1)
 
 
@@ -380,9 +394,13 @@ class ZImage(nn.Module):
         all_x_embedder = {}
         all_final_layer = {}
         # seems for ablations here, gonna keep it
-        for patch_size, f_patch_size in zip(params.all_patch_size, params.all_f_patch_size):
+        for patch_size, f_patch_size in zip(
+            params.all_patch_size, params.all_f_patch_size
+        ):
             x_embedder = nn.Linear(
-                f_patch_size * patch_size * patch_size * params.in_channels, params.dim, bias=True
+                f_patch_size * patch_size * patch_size * params.in_channels,
+                params.dim,
+                bias=True,
             )
             all_x_embedder[f"{patch_size}-{f_patch_size}"] = x_embedder
             final_layer = FinalLayer(
@@ -426,7 +444,9 @@ class ZImage(nn.Module):
             ]
         )
 
-        self.t_embedder = TimestepEmbedder(min(params.dim, params.adaln_embed_dim), mid_size=1024)
+        self.t_embedder = TimestepEmbedder(
+            min(params.dim, params.adaln_embed_dim), mid_size=1024
+        )
         self.cap_embedder = nn.Sequential(
             RMSNorm(params.cap_feat_dim, eps=params.norm_eps),
             nn.Linear(params.cap_feat_dim, params.dim, bias=True),
@@ -457,7 +477,9 @@ class ZImage(nn.Module):
         self.axes_lens = params.axes_lens
 
         self.rope_embedder = RopeEmbedder(
-            theta=params.rope_theta, axes_dims=params.axes_dims, axes_lens=params.axes_lens
+            theta=params.rope_theta,
+            axes_dims=params.axes_dims,
+            axes_lens=params.axes_lens,
         )
 
     def forward(
@@ -468,9 +490,13 @@ class ZImage(nn.Module):
         txt: Tensor,  # embedding from text encoder
         txt_ids: Tensor,  # text id starts at 1 for the backbone
         txt_mask: Tensor,  # mask the padding tensor
-        timesteps: Tensor,  # 0-1000 scale 0 is full noise 1000 is full image
+        timesteps: Tensor,  # 1-0 scale 1 is full noise 0 is full image
     ):
-
+        # zimage use 0-1000 standard where 0 is full noise and 1000 is full image
+        timesteps = (
+            1 - timesteps
+        )  # flips the timestep so i don't have to change the code
+        timesteps *= self.t_scale  # scaling it from 0-1 to 0-1000
         timesteps_embedding = self.t_embedder(timesteps)
         # seems they have plan for different projection, gonna keep the name for compatibility
         img_hidden = self.all_x_embedder[f"2-1"](img)
@@ -481,11 +507,19 @@ class ZImage(nn.Module):
 
         # noise input precond transformer
         for layer in self.noise_refiner:
-            img_hidden = layer(img_hidden, img_mask, img_pe, timesteps_embedding)
+            if self.training:
+                img_hidden = ckpt.checkpoint(
+                    layer, img_hidden, img_mask, img_pe, timesteps_embedding
+                )
+            else:
+                img_hidden = layer(img_hidden, img_mask, img_pe, timesteps_embedding)
 
         # text input precond transformer
         for layer in self.context_refiner:
-            txt_hidden = layer(txt_hidden, txt_mask, txt_pe)
+            if self.training:
+                txt_hidden = ckpt.checkpoint(layer, txt_hidden, txt_mask, txt_pe)
+            else:
+                txt_hidden = layer(txt_hidden, txt_mask, txt_pe)
 
         # fuse everything
         mixed_hidden = torch.cat((txt_hidden, img_hidden), 1)
@@ -494,16 +528,31 @@ class ZImage(nn.Module):
 
         # pipe it into classical transformers
         for layer in self.layers:
-            mixed_hidden = layer(
-                mixed_hidden, mixed_mask, mixed_pe, timesteps_embedding
-            )
+            if self.training:
+                mixed_hidden = ckpt.checkpoint(
+                    layer, mixed_hidden, mixed_mask, mixed_pe, timesteps_embedding
+                )
+            else:
+                mixed_hidden = layer(
+                    mixed_hidden, mixed_mask, mixed_pe, timesteps_embedding
+                )
 
         # BLD cut out the text and only return the image tensor
         img_hidden = mixed_hidden[:, txt.shape[1] :, ...]
 
         # final layer then project back to data space
-        output = self.all_final_layer[f"2-1"](
-            mixed_hidden[:, txt.shape[1] :, ...], mixed_hidden
-        )
+        if self.training:
+            output = ckpt.checkpoint(
+                self.all_final_layer[f"2-1"],
+                mixed_hidden[:, txt.shape[1] :, ...],
+                timesteps_embedding,
+            )
+        else:
+            output = self.all_final_layer[f"2-1"](
+                mixed_hidden[:, txt.shape[1] :, ...], timesteps_embedding
+            )
 
-        return output
+        # flip the output vectors
+        # this took way too long to figure out 
+        # why the vector direction is wrong
+        return -output
