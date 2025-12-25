@@ -62,6 +62,7 @@ class TrainingConfig:
     save_every: int
     save_folder: str
     do_profiling: bool
+    trained_layer_keywords: list[str]
     aim_path: Optional[str] = None
     aim_experiment_name: Optional[str] = None
     aim_hash: Optional[str] = None
@@ -477,13 +478,7 @@ def train_chroma(rank, world_size, wrap_models, wrap_config, debug=False):
     torch.manual_seed(training_config.master_seed)
     random.seed(training_config.master_seed)
 
-    trained_layer_keywords = [
-        "double_blocks",
-        "single_blocks",
-        "img_in_patch",
-        "nerf_final_layer",
-        "nerf_blocks",
-    ]
+    trained_layer_keywords = training_config.trained_layer_keywords
 
     # Setup ZeRO-1: Shard optimizer states across workers
     # Each worker only maintains optimizer states for a subset of parameters
