@@ -50,6 +50,7 @@ chroma_params = ChromaParams(
     approximator_depth=5,
     approximator_hidden_size=5120,
     _use_compiled=False,
+    use_x0=False,
 )
 
 
@@ -169,12 +170,16 @@ class Chroma(nn.Module):
         )
         self.approximator_in_dim = params.approximator_in_dim
 
+        if params.use_x0:
+            print("the model is using x0 prediction")
+            self.register_buffer("__x0__", torch.tensor([]))
+
     @property
     def device(self):
         # Get the device of the module (assumes all parameters are on the same device)
         return next(self.parameters()).device
 
-    def forward(
+    def _forward(
         self,
         img: Tensor,
         img_ids: Tensor,
@@ -275,3 +280,37 @@ class Chroma(nn.Module):
             img, distill_vec=final_mod
         )  # (N, T, patch_size ** 2 * out_channels)
         return img
+
+    def _apply_x0_residual(self, predicted, noisy, timesteps):
+
+        # non zero during training to prevent 0 div
+        eps = 5e-2 if self.training else 0.0
+        return (noisy - predicted) / (timesteps.view(-1,1,1,1) + eps)
+
+    def forward(
+        self,
+        img: Tensor,
+        img_ids: Tensor,
+        txt: Tensor,
+        txt_ids: Tensor,
+        txt_mask: Tensor,
+        timesteps: Tensor,
+        guidance: Tensor,
+        attn_padding: int = 1,
+    ):
+        out = self._forward(
+            img=img,
+            img_ids=img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            txt_mask=txt_mask,
+            timesteps=timesteps,
+            guidance=guidance,
+            attn_padding=attn_padding,
+        )
+
+        # If x0 variant → v-pred, just return this instead
+        if hasattr(self, "__x0__"):
+            return self._apply_x0_residual(out, img, timesteps)
+
+        return out
