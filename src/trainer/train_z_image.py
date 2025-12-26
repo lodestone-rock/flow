@@ -638,7 +638,10 @@ def train_zimage(rank, world_size, wrap_models, wrap_config, debug=False):
                 noisy_images.requires_grad_(True)
                 ot_bs = acc_images.shape[0]
 
+                # aliasing
                 mb = training_config.train_minibatch
+
+                # Calculate how many minibatches to process for each parameter update
                 local_num_minibatches = dataloader_config.batch_size // mb // world_size
                 updates_per_large_batch = max(
                     1, training_config.updates_per_large_batch
@@ -659,7 +662,8 @@ def train_zimage(rank, world_size, wrap_models, wrap_config, debug=False):
                     with torch.no_grad(), torch.autocast(
                         device_type="cuda", dtype=torch.bfloat16
                     ):
-                        # Slice captions for the current minibatch
+
+                        # 1. Slice captions for the current minibatch
                         minibatch_captions = caption[tmb_i * mb : tmb_i * mb + mb]
 
                         # Format prompts with Qwen chat template
@@ -674,7 +678,7 @@ def train_zimage(rank, world_size, wrap_models, wrap_config, debug=False):
                             )
                             formatted_prompts.append(formatted_prompt)
 
-                        # Tokenize and compute embeddings
+                        # 2. Tokenize and compute embeddings on the fly
                         text_inputs = qwen_tokenizer(
                             formatted_prompts,
                             padding="max_length",
@@ -690,6 +694,9 @@ def train_zimage(rank, world_size, wrap_models, wrap_config, debug=False):
                         ).hidden_states[-2]
 
                         minibatch_mask = text_inputs.attention_mask.bool()
+                        img_mask = torch.ones(
+                            noisy_images.shape[:2], device=noisy_images.device
+                        ).bool()
 
                         # Prepare position IDs
                         n, c, h, w = latent_shape
@@ -714,6 +721,7 @@ def train_zimage(rank, world_size, wrap_models, wrap_config, debug=False):
                                 rank, non_blocking=True
                             ),
                             img_ids=image_pos_id,
+                            img_mask=img_mask[tmb_i * mb : tmb_i * mb + mb],
                             txt=minibatch_embeddings[tmb_i * mb : tmb_i * mb + mb],
                             txt_ids=text_ids,
                             txt_mask=minibatch_mask[tmb_i * mb : tmb_i * mb + mb],
@@ -792,6 +800,7 @@ def train_zimage(rank, world_size, wrap_models, wrap_config, debug=False):
 
                 # Save checkpoint
                 if (counter + 1) % training_config.save_every == 0 and rank == 0:
+
                     model_filename = f"{training_config.save_folder}/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pth"
                     torch.save(model.state_dict(), model_filename)
 
@@ -828,6 +837,7 @@ def train_zimage(rank, world_size, wrap_models, wrap_config, debug=False):
                     all_inference_configs = [inference_config] + extra_inference_config
 
                     for config_idx, current_config in enumerate(all_inference_configs):
+                        # Generate all images for the current config in a single batch
                         images_tensor = inference_wrapper(
                             model=model,
                             ae=ae,
@@ -871,6 +881,8 @@ def train_zimage(rank, world_size, wrap_models, wrap_config, debug=False):
                     del images_tensor
                     torch.cuda.empty_cache()
 
+                    # Synchronize all processes. This is crucial to ensure all ranks have finished
+                    # writing their files before rank 0 attempts to read them.
                     if not debug:
                         dist.barrier()
 
@@ -994,7 +1006,6 @@ def main(config="training_config.json"):
         model_config,
         extra_inference_config,
     ]
-
     # load model
     with torch.no_grad():
         # Load Z-Image model

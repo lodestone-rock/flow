@@ -32,6 +32,7 @@ class ZImageParams:
     axes_dims: list[int]
     axes_lens: list[int]
     adaln_embed_dim: int
+    use_x0: bool
 
 
 z_image_params = ZImageParams(
@@ -51,6 +52,7 @@ z_image_params = ZImageParams(
     axes_dims=[32, 48, 48],
     axes_lens=[1536, 512, 512],
     adaln_embed_dim=256,
+    use_x0=False,
 )
 
 
@@ -482,7 +484,16 @@ class ZImage(nn.Module):
             axes_lens=params.axes_lens,
         )
 
-    def forward(
+        if params.use_x0:
+            print("the model is using x0 prediction")
+            self.register_buffer("__x0__", torch.tensor([]))
+
+    @property
+    def device(self):
+        # Get the device of the module (assumes all parameters are on the same device)
+        return next(self.parameters()).device
+
+    def _forward(
         self,
         img: Tensor,  # image tensor
         img_ids: Tensor,  # img id is 3d where the first dim is text, second and 3rd is the hw
@@ -553,6 +564,38 @@ class ZImage(nn.Module):
             )
 
         # flip the output vectors
-        # this took way too long to figure out 
+        # this took way too long to figure out
         # why the vector direction is wrong
         return -output
+
+    def _apply_x0_residual(self, predicted, noisy, timesteps):
+
+        # non zero during training to prevent 0 div
+        eps = 5e-2 if self.training else 0.0
+        return (noisy - predicted) / (timesteps.view(-1, 1, 1, 1) + eps)
+
+    def forward(
+        self,
+        img: Tensor,
+        img_ids: Tensor,
+        img_mask: Tensor,
+        txt: Tensor,
+        txt_ids: Tensor,
+        txt_mask: Tensor,
+        timesteps: Tensor,
+    ):
+        out = self._forward(
+            img=img,
+            img_ids=img_ids,
+            img_mask=img_mask,
+            txt=txt,
+            txt_ids=txt_ids,
+            txt_mask=txt_mask,
+            timesteps=timesteps,
+        )
+
+        # If x0 variant → v-pred, just return this instead
+        if hasattr(self, "__x0__"):
+            return self._apply_x0_residual(out, img, timesteps)
+
+        return out
