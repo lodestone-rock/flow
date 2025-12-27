@@ -13,3 +13,10 @@ datasets
 /models
 scribble*
 /wandb
+init.sh
+/.vscode
+*.txt
+*.log
+*.safetensors
+*.zip
+*.gz
