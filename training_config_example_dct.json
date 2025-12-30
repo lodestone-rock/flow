@@ -1,0 +1,64 @@
+{
+    "training": {
+        "master_seed": 45,
+        "cache_minibatch": 8,
+        "train_minibatch": 8,
+        "gradient_accumulation_steps": 4,
+        "lr": 1e-04,
+        "weight_decay": 0.01,
+        "warmup_steps": 100,
+        "max_grad_norm": 1.0,
+        "save_every": 100,
+        "save_folder": "/mnt/datapool_u2/models/z-image-dct",
+        "trained_layer_keywords": [
+            "x_embedder",
+            "t_embedder",
+            "cap_embedder",
+            "noise_refiner",
+            "context_refiner",
+            "layers",
+            "dec_net"
+        ],
+        "use_aim": true,
+        "aim_path": "aim://localhost:4893",
+        "aim_experiment_name": "z-image-dct",
+        "do_profiling": false,
+        "profile_steps": 7,
+        "profile_json_dump": "grad_accum_4.json"
+    },
+    "inference": {
+        "inference_every": 25,
+        "inference_folder": "preview_dct",
+        "steps": 20,
+        "cfg": 3,
+        "prompts": [
+            "a cute cat sat on a mat while receiving a head pat from his owner called Matt",
+            "baked potato, on the space floating orbiting around the earth"
+        ],
+        "first_n_steps_wo_cfg": 0,
+        "image_dim": [256, 256],
+        "max_sequence_length": 512
+    },
+    "dataloader": {
+        "batch_size": 16,
+        "jsonl_metadata_path": "fast_training_weighted_blackblaze.jsonl",
+        "image_folder_path": "",
+        "base_resolution": [256],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.3,
+        "uncond_percentage": 0.1,
+        "resolution_step": 64,
+        "num_workers": 1,
+        "prefetch_factor": 1,
+        "ratio_cutoff": 2.0,
+        "offset": 0
+    },
+    "model": {
+        "z_image_path": "/mnt/datapool_u2/models/z-image-dct/2025-12-30_10-39-47.pth",
+        "vae_path": "/mnt/datapool_u2/models/z-image/ae_ch32.safetensors",
+        "qwen_path": "/mnt/datapool_u2/models/z-image/text_encoder",
+        "qwen_tokenizer_path": "/mnt/datapool_u2/models/z-image/tokenizer",
+        "max_sequence_length": 512,
+        "use_x0": true
+    }
+}

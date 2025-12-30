@@ -2,61 +2,43 @@
 
 import math
 from typing import List, Optional
+from functools import lru_cache
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from dataclasses import dataclass
 import torch.utils.checkpoint as ckpt
 
 
 @dataclass
 class ZImageDCTParams:
-    all_patch_size: tuple[int, ...]
-    all_f_patch_size: tuple[int, ...]
-    in_channels: int
-    dim: int
-    n_layers: int
-    n_refiner_layers: int
-    n_heads: int
-    n_kv_heads: int
-    norm_eps: float
-    qk_norm: bool
-    cap_feat_dim: int
-    rope_theta: int
-    t_scale: float
-    axes_dims: list[int]
-    axes_lens: list[int]
-    adaln_embed_dim: int
-    use_x0: bool
+    patch_size: int = 1
+    f_patch_size: int = 1
+    in_channels: int = 128
+    dim: int = 3840
+    n_layers: int = 30
+    n_refiner_layers: int = 2
+    n_heads: int = 30
+    n_kv_heads: int = 30
+    norm_eps: float = 1e-5
+    qk_norm: bool = True
+    cap_feat_dim: int = 2560
+    rope_theta: int = 256
+    t_scale: float = 1000.0
+    axes_dims: list[int] = field(default_factory=lambda: [32, 48, 48])
+    axes_lens: list[int] = field(default_factory=lambda: [1536, 512, 512])
+    adaln_embed_dim: int = 256
+    use_x0: bool = True
     # DCT decoder params
-    decoder_hidden_size: int
-    decoder_num_res_blocks: int
+    decoder_hidden_size: int = 3840
+    decoder_num_res_blocks: int = 4
+    decoder_max_freqs: int = 8
 
 
-z_image_dct_params = ZImageDCTParams(
-    all_patch_size=(2,),
-    all_f_patch_size=(1,),
-    in_channels=16,
-    dim=3840,
-    n_layers=30,
-    n_refiner_layers=2,
-    n_heads=30,
-    n_kv_heads=30,
-    norm_eps=1e-5,
-    qk_norm=True,
-    cap_feat_dim=2560,
-    rope_theta=256,
-    t_scale=1000.0,
-    axes_dims=[32, 48, 48],
-    axes_lens=[1536, 512, 512],
-    adaln_embed_dim=256,
-    use_x0=False,
-    # DCT decoder params
-    decoder_hidden_size=64,
-    decoder_num_res_blocks=4,
-)
+# Default params instance
+z_image_dct_params = ZImageDCTParams()
 
 
 def _process_mask(attn_mask: Optional[torch.Tensor], dtype: torch.dtype):
@@ -352,17 +334,71 @@ class RopeEmbedder:
 
 
 # ============================================================================
-# SimpleMLPAdaLN Decoder (from deco.py)
+# Decoder Components
 # ============================================================================
 
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
 
 
+class NerfEmbedder(nn.Module):
+    """
+    An embedder module that combines input features with a 2D positional
+    encoding that mimics the Discrete Cosine Transform (DCT).
+
+    This module takes an input tensor of shape (B, P^2, C), where P is the
+    patch size, and enriches it with positional information before projecting
+    it to a new hidden size.
+    """
+    def __init__(self, in_channels, hidden_size_input, max_freqs):
+        super().__init__()
+        self.max_freqs = max_freqs
+        self.hidden_size_input = hidden_size_input
+        
+        self.embedder = nn.Sequential(
+            nn.Linear(in_channels + max_freqs**2, hidden_size_input)
+        )
+
+    @lru_cache(maxsize=4)
+    def fetch_pos(self, patch_size, device, dtype):
+        """Generates and caches 2D DCT-like positional embeddings."""
+        pos_x = torch.linspace(0, 1, patch_size, device=device, dtype=dtype)
+        pos_y = torch.linspace(0, 1, patch_size, device=device, dtype=dtype)
+        pos_y, pos_x = torch.meshgrid(pos_y, pos_x, indexing="ij")
+        
+        pos_x = pos_x.reshape(-1, 1, 1)
+        pos_y = pos_y.reshape(-1, 1, 1)
+        
+        freqs = torch.linspace(0, self.max_freqs - 1, self.max_freqs, dtype=dtype, device=device)
+        freqs_x = freqs[None, :, None]
+        freqs_y = freqs[None, None, :]
+        
+        coeffs = (1 + freqs_x * freqs_y) ** -1
+        dct_x = torch.cos(pos_x * freqs_x * torch.pi)
+        dct_y = torch.cos(pos_y * freqs_y * torch.pi)
+        dct = (dct_x * dct_y * coeffs).view(1, -1, self.max_freqs ** 2)
+        
+        return dct
+
+    def forward(self, inputs):
+        B, P2, C = inputs.shape
+        original_dtype = inputs.dtype
+        
+        with torch.autocast("cuda", enabled=False):
+            patch_size = int(P2 ** 0.5)
+            inputs = inputs.float()
+            dct = self.fetch_pos(patch_size, inputs.device, torch.float32)
+            dct = dct.repeat(B, 1, 1)
+            inputs = torch.cat([inputs, dct], dim=-1)
+            inputs = self.embedder.float()(inputs)
+        
+        return inputs.to(original_dtype)
+
+
 class ResBlock(nn.Module):
     """
-    A residual block that can optionally change the number of channels.
-    :param channels: the number of input channels.
+    A residual block with AdaLN modulation.
+    Initialized to identity (zero modulation output).
     """
 
     def __init__(self, channels):
@@ -380,6 +416,20 @@ class ResBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(channels, 3 * channels, bias=True)
         )
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        # Kaiming init for MLP
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='linear')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        
+        # Zero init for modulation (identity at init)
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
     def forward(self, x, y):
         shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(3, dim=-1)
@@ -389,13 +439,16 @@ class ResBlock(nn.Module):
 
 
 class DCTFinalLayer(nn.Module):
-    """
-    The final layer adopted from DiT.
-    """
+    """The final layer adopted from DiT."""
+    
     def __init__(self, model_channels, out_channels):
         super().__init__()
         self.norm_final = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(model_channels, out_channels, bias=True)
+        
+        # Zero init for output layer
+        nn.init.constant_(self.linear.weight, 0)
+        nn.init.constant_(self.linear.bias, 0)
 
     def forward(self, x):
         x = self.norm_final(x)
@@ -406,13 +459,7 @@ class DCTFinalLayer(nn.Module):
 class SimpleMLPAdaLN(nn.Module):
     """
     The MLP decoder for Z-Image DCT variant.
-    :param in_channels: channels in the input Tensor (pixel values).
-    :param model_channels: base channel count for the model.
-    :param out_channels: channels in the output Tensor.
-    :param z_channels: channels in the condition (from transformer backbone).
-    :param num_res_blocks: number of residual blocks.
-    :param patch_size: patch size for reshaping condition.
-    :param grad_checkpointing: whether to use gradient checkpointing.
+    Uses NerfEmbedder for input projection and ResBlocks with AdaLN.
     """
 
     def __init__(
@@ -423,6 +470,7 @@ class SimpleMLPAdaLN(nn.Module):
         z_channels,
         num_res_blocks,
         patch_size,
+        max_freqs=8,
         grad_checkpointing=False
     ):
         super().__init__()
@@ -434,34 +482,27 @@ class SimpleMLPAdaLN(nn.Module):
         self.grad_checkpointing = grad_checkpointing
         self.patch_size = patch_size
 
+        # Condition embedding from transformer backbone
         self.cond_embed = nn.Linear(z_channels, patch_size**2 * model_channels)
-        self.input_proj = nn.Linear(in_channels, model_channels)
+
+        # NerfEmbedder for input projection with DCT positional encoding
+        self.input_embedder = NerfEmbedder(
+            in_channels=in_channels,
+            hidden_size_input=model_channels,
+            max_freqs=max_freqs
+        )
         
-        res_blocks = []
-        for i in range(num_res_blocks):
-            res_blocks.append(ResBlock(model_channels))
+        # Residual blocks with AdaLN (each block handles its own init)
+        self.res_blocks = nn.ModuleList([
+            ResBlock(model_channels) for _ in range(num_res_blocks)
+        ])
 
-        self.res_blocks = nn.ModuleList(res_blocks)
+        # Final layer (handles its own init)
         self.final_layer = DCTFinalLayer(model_channels, out_channels)
-
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-        self.apply(_basic_init)
-
-        # Zero-out adaLN modulation layers
-        for block in self.res_blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-        # Zero-out output layers
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        
+        # Init cond_embed with xavier
+        nn.init.xavier_uniform_(self.cond_embed.weight)
+        nn.init.constant_(self.cond_embed.bias, 0)
 
     def forward(self, x, c):
         """
@@ -470,11 +511,14 @@ class SimpleMLPAdaLN(nn.Module):
         :param c: conditioning from transformer backbone [N x z_channels].
         :return: an [N x P^2 x C] Tensor of outputs.
         """
-        x = self.input_proj(x)
+        # Project input with DCT positional encoding
+        x = self.input_embedder(x)
+        
+        # Embed condition and reshape for per-position modulation
         c = self.cond_embed(c)
-
         y = c.reshape(c.shape[0], self.patch_size**2, -1)
 
+        # Pass through residual blocks
         if self.grad_checkpointing and not torch.jit.is_scripting():
             for block in self.res_blocks:
                 x = ckpt.checkpoint(block, x, y)
@@ -494,19 +538,13 @@ class ZImageDCT(nn.Module):
         super().__init__()
         self.in_channels = params.in_channels
         self.out_channels = params.in_channels
-        self.all_patch_size = params.all_patch_size
-        self.all_f_patch_size = params.all_f_patch_size
+        self.patch_size = params.patch_size
+        self.f_patch_size = params.f_patch_size
         self.dim = params.dim
         self.n_heads = params.n_heads
         self.rope_theta = params.rope_theta
         self.t_scale = params.t_scale
         self.adaln_embed_dim = params.adaln_embed_dim
-
-        assert len(params.all_patch_size) == len(params.all_f_patch_size)
-
-        # For DCT variant, we use a fixed patch size of 2
-        self.patch_size = params.all_patch_size[0]
-        self.f_patch_size = params.all_f_patch_size[0]
 
         # Input embedder for the backbone (same as original)
         self.x_embedder = nn.Linear(
@@ -592,21 +630,16 @@ class ZImageDCT(nn.Module):
             axes_lens=params.axes_lens,
         )
 
-        # Replace FinalLayer with SimpleMLPAdaLN decoder
-        # Input projection for pixel values going into the decoder
-        self.decoder_input_proj = nn.Linear(
-            params.in_channels,
-            params.decoder_hidden_size
-        )
-
-        # SimpleMLPAdaLN decoder head
+        # SimpleMLPAdaLN decoder head with NerfEmbedder
+        # Uses DCT positional encoding for input projection
         self.dec_net = SimpleMLPAdaLN(
-            in_channels=params.decoder_hidden_size,
+            in_channels=params.in_channels,
             model_channels=params.decoder_hidden_size,
             out_channels=params.in_channels,
             z_channels=params.dim,
             num_res_blocks=params.decoder_num_res_blocks,
             patch_size=self.patch_size,
+            max_freqs=params.decoder_max_freqs,
             grad_checkpointing=False
         )
 
@@ -686,19 +719,15 @@ class ZImageDCT(nn.Module):
         # Reshape hidden states: [B, N, dim] -> [B*N, dim]
         decoder_condition = img_hidden.reshape(B * num_patches, self.dim)
 
-        # Project pixel values to decoder hidden size
-        # pixel_values: [B*N, P*P, C] -> [B*N, P*P, decoder_hidden_size]
-        decoder_input = self.decoder_input_proj(pixel_values)
-
-        # Pass through SimpleMLPAdaLN decoder
+        # Pass through SimpleMLPAdaLN decoder (NerfEmbedder handles input projection)
         if self.training:
             output = ckpt.checkpoint(
                 self.dec_net,
-                decoder_input,
+                pixel_values,
                 decoder_condition
             )
         else:
-            output = self.dec_net(decoder_input, decoder_condition)
+            output = self.dec_net(pixel_values, decoder_condition)
 
         # Reshape output back: [B*N, P*P, C] -> [B, N, C*P*P]
         output = output.reshape(B, num_patches, -1)
@@ -708,7 +737,7 @@ class ZImageDCT(nn.Module):
 
     def _apply_x0_residual(self, predicted, noisy, timesteps):
         eps = 5e-2 if self.training else 0.0
-        return (noisy - predicted) / (timesteps.view(-1, 1, 1, 1) + eps)
+        return (noisy - predicted) / (timesteps.view(-1, 1, 1) + eps)
 
     def forward(
         self,
