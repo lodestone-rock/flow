@@ -1,0 +1,95 @@
+{
+    "training": {
+        "master_seed": 52924,
+        "cache_minibatch": 8,
+        "train_minibatch": 4,
+        "offload_param_count": 0,
+        "lr": 1e-05,
+        "weight_decay": 0.0,
+        "warmup_steps": 50,
+        "change_layer_every": 8,
+        "trained_single_blocks": 38,
+        "trained_double_blocks": 19,
+        "save_every": 50,
+        "save_folder": "radiance_x0",
+        "aim_path": "aim://localhost:4893",
+        "aim_experiment_name": "nerf_conv_head",
+        "aim_hash": null,
+        "aim_steps": 0,
+        "hf_repo_id": null,
+        "hf_token": null,
+        "updates_per_large_batch": 2,
+        "do_profiling": false,
+        "trained_layer_keywords": [
+            "double_blocks",
+            "single_blocks",
+            "img_in_patch",
+            "nerf_final_layer",
+            "nerf_blocks"
+        ]
+    
+    },
+    "inference": {
+        "inference_every": 50,
+        "inference_folder": "preview",
+        "steps": 20,
+        "guidance": 0,
+        "cfg": 3,
+        "prompts": [
+            "a cute cat sat on a mat while receiving a head pat from his owner called Matt",
+            "baked potato, on the space floating orbiting around the earth"
+        ],
+        "first_n_steps_wo_cfg": 0,
+        "image_dim": [
+            512,
+            512
+        ],
+        "t5_max_length": 512
+    },
+    "extra_inference_config": [
+        {
+            "inference_every": 50,
+            "inference_folder": "preview",
+            "steps": 20,
+            "guidance": 0,
+            "cfg": 4,
+            "prompts": [
+                "a cute cat sat on a mat while receiving a head pat from his owner called Matt",
+                "baked potato, on the space floating orbiting around the earth"
+            ],
+            "first_n_steps_wo_cfg": 0,
+            "image_dim": [
+                512,
+                512
+            ],
+            "t5_max_length": 512
+        }
+    ],
+    "dataloader": {
+        "batch_size": 252,
+        "jsonl_metadata_path": "fast_training_weighted_blackblaze.jsonl",
+        "image_folder_path": "",
+        "base_resolution": [
+            512
+        ],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.3,
+        "uncond_percentage": 0.1,
+        "resolution_step": 64,
+        "num_workers": 1,
+        "prefetch_factor": 1,
+        "ratio_cutoff": 2.0,
+        "thread_per_worker": 1,
+        "offset": 0
+    },
+    "model": {
+        "chroma_path": "current_x0.safetensors",
+        "t5_path": "chroma/text_encoder_2",
+        "t5_config_path": "chroma/text_encoder_2/config.json",
+        "t5_tokenizer_path": "chroma/tokenizer_2",
+        "t5_to_8bit": true,
+        "t5_max_length": 512,
+        "use_x0": true,
+        "use_patch_size_32": false
+    }
+}
