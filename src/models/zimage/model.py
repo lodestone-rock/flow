@@ -414,6 +414,9 @@ class ZImage(nn.Module):
 
         self.all_x_embedder = nn.ModuleDict(all_x_embedder)
         self.all_final_layer = nn.ModuleDict(all_final_layer)
+        
+        # Store the default key for forward pass (use first patch_size/f_patch_size pair)
+        self._default_key = f"{params.all_patch_size[0]}-{params.all_f_patch_size[0]}"
 
         self.noise_refiner = nn.ModuleList(
             [
@@ -509,8 +512,8 @@ class ZImage(nn.Module):
         )  # flips the timestep so i don't have to change the code
         timesteps *= self.t_scale  # scaling it from 0-1 to 0-1000
         timesteps_embedding = self.t_embedder(timesteps)
-        # seems they have plan for different projection, gonna keep the name for compatibility
-        img_hidden = self.all_x_embedder[f"2-1"](img)
+        # Use dynamic key based on params (supports different patch sizes)
+        img_hidden = self.all_x_embedder[self._default_key](img)
         txt_hidden = self.cap_embedder(txt)
 
         img_pe = self.rope_embedder(img_ids)
@@ -554,12 +557,12 @@ class ZImage(nn.Module):
         # final layer then project back to data space
         if self.training:
             output = ckpt.checkpoint(
-                self.all_final_layer[f"2-1"],
+                self.all_final_layer[self._default_key],
                 mixed_hidden[:, txt.shape[1] :, ...],
                 timesteps_embedding,
             )
         else:
-            output = self.all_final_layer[f"2-1"](
+            output = self.all_final_layer[self._default_key](
                 mixed_hidden[:, txt.shape[1] :, ...], timesteps_embedding
             )
 
