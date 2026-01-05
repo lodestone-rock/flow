@@ -333,6 +333,14 @@ class TextImageDataset(Dataset):
                 )
                 continue
 
+        # resample randomly if the entire batch failed
+        if len(images) < 1:
+            log.info(
+                f"An Empty batch is caught! This batch will be discarded and a random batch will be fetch."
+            )
+            new_batch_index = random.randrange(0, len(self.batches))
+            return self.__getitem__(new_batch_index)
+
         # echo short batch
         if self.rank_batch_size > 1:
             while len(images) < self.rank_batch_size:
@@ -344,7 +352,7 @@ class TextImageDataset(Dataset):
                 training_prompts.append(training_prompts[echoed_index])
                 loss_weighting.append(loss_weighting[echoed_index])
 
-        # resample randomly if the entire batch failed
+        # This check is now redundant but kept for safety
         while len(images) < 1:
             log.info(
                 f"An Empty batch is caught! This batch will be discarded and a random batch will be fetch."
