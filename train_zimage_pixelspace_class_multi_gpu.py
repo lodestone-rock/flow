@@ -488,7 +488,11 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         print("All models loaded!")
     
     def _load_zimage(self):
-        """Load Z-Image model for pixel space and replicate to all GPUs."""
+        """Load Z-Image model for pixel space and replicate to all GPUs.
+        
+        Uses meta device to avoid allocating RAM for the base model,
+        then materializes directly onto each GPU.
+        """
         print("  Loading Z-Image (Pixel Space)...")
         
         patch_size = self.training_config.pixel_patch_size
@@ -497,38 +501,100 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         # Create params for pixel space model
         # patch_size=32, in_channels=3072 (32x32x3 RGB patches)
         pixel_params = ZImageDCTParams(
-            patch_size=patch_size,
+            patch_size=1,
             in_channels=in_channels,
             use_x0=self.model_config.use_x0,
         )
         
-        # Create base model (randomly initialized)
-        base_model = ZImageDCT(pixel_params)
-        
-        # Load weights from checkpoint if provided
+        # Load checkpoint state dict first (if provided)
+        checkpoint_state_dict = None
         if self.model_config.z_image_path:
             print(f"    Loading checkpoint: {self.model_config.z_image_path}")
             checkpoint_state_dict = self._load_state_dict(self.model_config.z_image_path)
-            
-            # Smart weight loading:
-            # - Loads matching weights from checkpoint
-            # - Keeps random init for new layers (e.g., dec_net) or shape mismatches (e.g., x_embedder)
-            # - If checkpoint already has the new layer weights, loads them instead of random init
-            load_weights_with_mismatch_handling(
-                base_model,
-                checkpoint_state_dict,
-                use_x0=self.model_config.use_x0,
-            )
-        else:
-            print("    No checkpoint provided, using random initialization")
             if self.model_config.use_x0:
-                base_model.register_buffer("__x0__", torch.tensor([]))
-
-        # Replicate to all GPUs
+                checkpoint_state_dict["__x0__"] = torch.tensor([])
+        
+        # Create models directly on each GPU using meta device to save RAM
         self.models = []
         for gpu_id in range(self.n_gpus):
-            model_copy = copy.deepcopy(base_model).to(f'cuda:{gpu_id}').to(torch.bfloat16)
-            self.models.append(model_copy)
+            device = f'cuda:{gpu_id}'
+            print(f"    Initializing model on {device}...")
+            
+            # Create model on meta device (no memory allocation)
+            with torch.device('meta'):
+                model = ZImageDCT(pixel_params)
+            
+            if checkpoint_state_dict is not None:
+                # Materialize model with checkpoint weights directly on target device
+                model_state_dict = model.state_dict()
+                loaded_keys = []
+                shape_mismatch_keys = []
+                new_keys = []
+                
+                for model_key, model_tensor in model_state_dict.items():
+                    if model_key in checkpoint_state_dict:
+                        ckpt_tensor = checkpoint_state_dict[model_key]
+                        if model_tensor.shape == ckpt_tensor.shape:
+                            # Shape matches - use checkpoint weight
+                            model_state_dict[model_key] = ckpt_tensor.to(device=device, dtype=torch.bfloat16)
+                            loaded_keys.append(model_key)
+                        else:
+                            # Shape mismatch - random init on device
+                            model_state_dict[model_key] = torch.empty(
+                                model_tensor.shape, device=device, dtype=torch.bfloat16
+                            )
+                            nn.init.kaiming_uniform_(model_state_dict[model_key]) if model_state_dict[model_key].dim() > 1 else nn.init.zeros_(model_state_dict[model_key])
+                            shape_mismatch_keys.append(
+                                f"{model_key}: model={list(model_tensor.shape)} vs ckpt={list(ckpt_tensor.shape)}"
+                            )
+                    else:
+                        # New layer - random init on device
+                        model_state_dict[model_key] = torch.empty(
+                            model_tensor.shape, device=device, dtype=torch.bfloat16
+                        )
+                        if model_state_dict[model_key].dim() > 1:
+                            nn.init.kaiming_uniform_(model_state_dict[model_key])
+                        else:
+                            nn.init.zeros_(model_state_dict[model_key])
+                        new_keys.append(model_key)
+                
+                # Load state dict with assign=True to replace meta tensors
+                model.load_state_dict(model_state_dict, assign=True)
+                
+                if gpu_id == 0:
+                    print(f"    Loaded: {len(loaded_keys)} keys")
+                    if shape_mismatch_keys:
+                        print(f"    Shape mismatch (random init): {len(shape_mismatch_keys)} keys")
+                        for key in shape_mismatch_keys[:5]:
+                            print(f"      - {key}")
+                        if len(shape_mismatch_keys) > 5:
+                            print(f"      ... and {len(shape_mismatch_keys) - 5} more")
+                    if new_keys:
+                        prefixes = set(k.split('.')[0] for k in new_keys)
+                        print(f"    New layers (random init): {len(new_keys)} keys")
+                        for prefix in sorted(prefixes):
+                            count = sum(1 for k in new_keys if k.startswith(prefix))
+                            print(f"      - {prefix}.* ({count} params)")
+            else:
+                # No checkpoint - random init directly on device
+                print("    No checkpoint provided, using random initialization")
+                model_state_dict = {}
+                for name, param in model.named_parameters():
+                    tensor = torch.empty(param.shape, device=device, dtype=torch.bfloat16)
+                    if tensor.dim() > 1:
+                        nn.init.kaiming_uniform_(tensor)
+                    else:
+                        nn.init.zeros_(tensor)
+                    model_state_dict[name] = tensor
+                for name, buf in model.named_buffers():
+                    model_state_dict[name] = torch.zeros(buf.shape, device=device, dtype=torch.bfloat16)
+                
+                if self.model_config.use_x0:
+                    model_state_dict["__x0__"] = torch.tensor([], device=device)
+                
+                model.load_state_dict(model_state_dict, assign=True)
+            
+            self.models.append(model)
         
         # Keep reference to first model for compatibility
         self.model = self.models[0]
