@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.cuda.nccl as nccl
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
@@ -263,11 +264,13 @@ class T5TextEncoder:
 # =============================================================================
 
 class ExperimentLogger:
-    """Handles experiment tracking with Aim."""
+    """Handles experiment tracking with Aim or CSV fallback."""
     
-    def __init__(self, config: TrainingConfig, hparams: Dict[str, Any]):
+    def __init__(self, config: TrainingConfig, hparams: Dict[str, Any], save_folder: str = "."):
         self.enabled = AIM_AVAILABLE and config.use_aim and config.aim_path
         self.run = None
+        self.csv_path = None
+        self.csv_file = None
         
         if self.enabled:
             self.run = Run(
@@ -275,11 +278,25 @@ class ExperimentLogger:
                 experiment=config.aim_experiment_name,
             )
             self.run["hparams"] = hparams
+        else:
+            # Fallback to CSV logging
+            self.csv_path = os.path.join(save_folder, "training_log.csv")
+            file_exists = os.path.exists(self.csv_path)
+            self.csv_file = open(self.csv_path, "a", newline="")
+            self.csv_writer = __import__("csv").writer(self.csv_file)
+            if not file_exists:
+                self.csv_writer.writerow(["step", "name", "value"])
+                self.csv_file.flush()
     
     def log_scalar(self, name: str, value: float, step: int):
         """Log a scalar value."""
         if self.run:
             self.run.track(value, name=name, step=step)
+        elif self.csv_file:
+            self.csv_writer.writerow([step, name, value])
+            # Flush periodically to ensure data is written
+            if step % 10 == 0:
+                self.csv_file.flush()
     
     def log_image(self, name: str, image_path: str, caption: str, step: int):
         """Log an image."""
@@ -290,16 +307,38 @@ class ExperimentLogger:
                 name=name,
                 step=step,
             )
+        # CSV doesn't support images, just skip
     
     def close(self):
         """Close the logger."""
         if self.run:
             self.run.close()
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
 
 
 # =============================================================================
 # Weight Loading Utilities
 # =============================================================================
+
+def dilate_patchify_weight_16_to_32(weight_16: torch.Tensor) -> torch.Tensor:
+    """
+    Dilate a 16x16 patchify kernel weight to 32x32.
+    Upsamples using nearest neighbor and divides by 4 to preserve output magnitude.
+    
+    Args:
+        weight_16: Weight tensor of shape (out_channels, in_channels, 16, 16)
+    
+    Returns:
+        Weight tensor of shape (out_channels, in_channels, 32, 32)
+    """
+    # F.interpolate expects (N, C, H, W), weight is (out_ch, in_ch, H, W)
+    # This works directly since out_ch acts as batch, in_ch acts as channels
+    weight_32 = F.interpolate(weight_16.float(), size=(32, 32), mode='nearest')
+    # Divide by 4 to preserve output magnitude (summing over 4x the area)
+    return weight_32 / 4.0
+
 
 def load_weights_with_mismatch_handling(
     model: nn.Module,
@@ -407,7 +446,11 @@ class ChromaTrainer(BaseTrainer):
         self._setup_dataset()
         
         # Setup logger
-        self.logger = ExperimentLogger(self.training_config, self.config_data)
+        self.logger = ExperimentLogger(
+            self.training_config, 
+            self.config_data,
+            save_folder=self.training_config.save_folder
+        )
         
         # Setup thread pool for multi-GPU execution
         self.executor = ThreadPoolExecutor(max_workers=self.n_gpus)
@@ -436,17 +479,48 @@ class ChromaTrainer(BaseTrainer):
         # Configure chroma params
         chroma_params._use_compiled = False  # Disable compilation for multi-GPU
         chroma_params.use_x0 = self.model_config.use_x0
-        chroma_params.use_patch_size_32 = self.model_config.use_patch_size_32
         
         # Load checkpoint state dict first (if provided)
         checkpoint_state_dict = None
+        checkpoint_is_32x32 = False
+        
         if self.model_config.chroma_path:
             print(f"    Loading checkpoint: {self.model_config.chroma_path}")
             checkpoint_state_dict = self._load_state_dict(self.model_config.chroma_path)
+            
+            # Check if checkpoint already has 32x32 patch weights
+            if "__32x32__" in checkpoint_state_dict:
+                checkpoint_is_32x32 = True
+                print("    Checkpoint has __32x32__ marker, weights are already 32x32")
+            elif "img_in_patch.weight" in checkpoint_state_dict:
+                ckpt_patch_weight = checkpoint_state_dict["img_in_patch.weight"]
+                if ckpt_patch_weight.shape[-1] == 32:  # kernel size is 32
+                    checkpoint_is_32x32 = True
+                    print(f"    Detected 32x32 patch weights from shape: {list(ckpt_patch_weight.shape)}")
+                else:
+                    print(f"    Detected 16x16 patch weights from shape: {list(ckpt_patch_weight.shape)}")
+            
             if self.model_config.use_x0:
                 checkpoint_state_dict["__x0__"] = torch.tensor([])
-            if self.model_config.use_patch_size_32:
-                checkpoint_state_dict["__32x32__"] = torch.tensor([])
+        
+        # Determine if we need to dilate 16x16 -> 32x32
+        need_dilation = (
+            self.model_config.use_patch_size_32 
+            and checkpoint_state_dict is not None 
+            and not checkpoint_is_32x32
+        )
+        
+        if need_dilation:
+            print("    Will dilate 16x16 patch weights to 32x32")
+        
+        # Set patch_size based on use_patch_size_32 flag
+        if self.model_config.use_patch_size_32:
+            chroma_params.patch_size = 32
+            chroma_params.use_patch_size_32 = True
+            print("    Using patch_size=32")
+        else:
+            chroma_params.patch_size = 16
+            print("    Using patch_size=16")
         
         # Create models directly on each GPU using meta device to save RAM
         self.models = []
@@ -464,6 +538,7 @@ class ChromaTrainer(BaseTrainer):
                 loaded_keys = []
                 shape_mismatch_keys = []
                 new_keys = []
+                dilated_keys = []
                 
                 for model_key, model_tensor in model_state_dict.items():
                     if model_key in checkpoint_state_dict:
@@ -472,16 +547,32 @@ class ChromaTrainer(BaseTrainer):
                             model_state_dict[model_key] = ckpt_tensor.to(device=device, dtype=torch.bfloat16)
                             loaded_keys.append(model_key)
                         else:
-                            model_state_dict[model_key] = torch.empty(
-                                model_tensor.shape, device=device, dtype=torch.bfloat16
-                            )
-                            if model_state_dict[model_key].dim() > 1:
-                                nn.init.kaiming_uniform_(model_state_dict[model_key])
+                            # Check if this is a patchify layer that needs dilation
+                            is_patchify_weight = model_key == "img_in_patch.weight"
+                            is_patchify_bias = model_key == "img_in_patch.bias"
+                            
+                            if need_dilation and is_patchify_weight:
+                                # Dilate 16x16 -> 32x32
+                                weight_16 = ckpt_tensor.to(device=device)
+                                weight_32 = dilate_patchify_weight_16_to_32(weight_16)
+                                model_state_dict[model_key] = weight_32.to(torch.bfloat16)
+                                dilated_keys.append(f"{model_key}: {list(ckpt_tensor.shape)} -> {list(model_tensor.shape)}")
+                            elif need_dilation and is_patchify_bias:
+                                # Bias doesn't need scaling, just copy
+                                model_state_dict[model_key] = ckpt_tensor.to(device=device, dtype=torch.bfloat16)
+                                dilated_keys.append(f"{model_key}: copied directly")
                             else:
-                                nn.init.zeros_(model_state_dict[model_key])
-                            shape_mismatch_keys.append(
-                                f"{model_key}: model={list(model_tensor.shape)} vs ckpt={list(ckpt_tensor.shape)}"
-                            )
+                                # Shape mismatch for non-patchify layers - random init
+                                model_state_dict[model_key] = torch.empty(
+                                    model_tensor.shape, device=device, dtype=torch.bfloat16
+                                )
+                                if model_state_dict[model_key].dim() > 1:
+                                    nn.init.kaiming_uniform_(model_state_dict[model_key])
+                                else:
+                                    nn.init.zeros_(model_state_dict[model_key])
+                                shape_mismatch_keys.append(
+                                    f"{model_key}: model={list(model_tensor.shape)} vs ckpt={list(ckpt_tensor.shape)}"
+                                )
                     else:
                         model_state_dict[model_key] = torch.empty(
                             model_tensor.shape, device=device, dtype=torch.bfloat16
@@ -492,10 +583,18 @@ class ChromaTrainer(BaseTrainer):
                             nn.init.zeros_(model_state_dict[model_key])
                         new_keys.append(model_key)
                 
+                # Add marker for 32x32 if we're using it
+                if self.model_config.use_patch_size_32:
+                    model_state_dict["__32x32__"] = torch.tensor([], device=device)
+                
                 model.load_state_dict(model_state_dict, assign=True)
                 
                 if gpu_id == 0:
                     print(f"    Loaded: {len(loaded_keys)} keys")
+                    if dilated_keys:
+                        print(f"    Dilated 16x16 -> 32x32: {len(dilated_keys)} keys")
+                        for key in dilated_keys:
+                            print(f"      - {key}")
                     if shape_mismatch_keys:
                         print(f"    Shape mismatch (random init): {len(shape_mismatch_keys)} keys")
                         for key in shape_mismatch_keys[:5]:
