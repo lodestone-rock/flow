@@ -229,7 +229,7 @@ class Chroma(nn.Module):
         if params.use_patch_size_32:
             print("the model is using patch size 32 prediction")
             self.register_buffer("__32x32__", torch.tensor([]))
-            self.params.patch_size *= 2
+        #     self.params.patch_size *= 2
 
     @property
     def device(self):
@@ -260,8 +260,8 @@ class Chroma(nn.Module):
         nerf_pixels = nerf_pixels.transpose(1, 2) # -> [B, NumPatches, C * P * P]
         
         # partchify ops
-        if hasattr(self, "__32x32__"):
-            img = F.interpolate(img, size=(H//2, W//2), mode="nearest")
+        # if hasattr(self, "__32x32__"):
+        #     img = F.interpolate(img, size=(H//2, W//2), mode="nearest")
 
         img = self.img_in_patch(img) # -> [B, Hidden, H/P, W/P]
         num_patches = img.shape[2] * img.shape[3]
@@ -277,6 +277,7 @@ class Chroma(nn.Module):
         # alternatively doing forward pass for every block manually is doable but slow
         # custom backward probably be better
         with torch.no_grad():
+            self.mod_index = self.mod_index.to(self.device)
             distill_timestep = timestep_embedding(timesteps, self.approximator_in_dim//4)
             # TODO: need to add toggle to omit this from schnell but that's not a priority
             distil_guidance = timestep_embedding(guidance, self.approximator_in_dim//4)
