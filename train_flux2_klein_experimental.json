@@ -1,0 +1,84 @@
+{
+    "training": {
+        "master_seed": 42,
+        "cache_minibatch": 8,
+        "train_minibatch": 8,
+        "gradient_accumulation_steps": 4,
+        "lr": 1e-5,
+        "weight_decay": 0.0,
+        "warmup_steps": 50,
+        "max_grad_norm": 1.0,
+        "save_every": 50,
+        "save_folder": "flux2_klein_checkpoints",
+        "trained_layer_keywords": [
+            "double_blocks",
+            "single_blocks",
+            "img_in",
+            "time_in",
+            "txt_in",
+            "double_stream_modulation_img",
+            "double_stream_modulation_txt",
+            "single_stream_modulation",
+            "final_layer"
+        ],
+        "do_profiling": false,
+        "profile_steps": 2,
+        "profile_json_dump": "flux2_profiler_dump.json",
+        "use_aim": false,
+        "aim_path": "aim://localhost:4893",
+        "aim_experiment_name": "flux2_klein_training"
+    },
+    "gan": {
+        "enabled": true,
+        "discriminator_lr": 1e-5,
+        "gan_loss_weight": 0.1,
+        "replay_buffer_size": 50,
+        "replay_buffer_prob": 0.8,
+        "target_d_loss": 0.693147,
+        "noise_ema_decay": 0.95,
+        "initial_noise_level": 1.0
+    },
+    "inference": {
+        "inference_every": 100,
+        "inference_folder": "flux2_inference_outputs",
+        "steps": 28,
+        "cfg": 4.0,
+        "first_n_steps_wo_cfg": 0,
+        "prompts": [
+            "a cute cat sat on a mat while receiving a head pat from his owner called Matt",
+            "baked potato, on the space floating orbiting around the earth"
+        ],
+        "image_dim": [
+            256,
+            256
+        ],
+        "qwen_max_length": 512
+    },
+    "dataloader": {
+        "batch_size": 16,
+        "jsonl_metadata_path": "debug_one img.jsonl",
+        "image_folder_path": "",
+        "base_resolution": [
+            256
+        ],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.3,
+        "uncond_percentage": 0.1,
+        "resolution_step": 64,
+        "num_workers": 2,
+        "prefetch_factor": 4,
+        "ratio_cutoff": 2.0,
+        "offset": 0
+    },
+    "model": {
+        "klein_path": "models/klein/flux-2-klein-base-4b.safetensors",
+        "vae_path": "models/z-image/ae_ch32.safetensors",
+        "qwen_path": "models/z-image/text_encoder",
+        "qwen_tokenizer_path": "models/z-image/tokenizer",
+        "qwen_max_length": 512,
+        "model_variant": "4b"
+    }
+
+
+
+}
