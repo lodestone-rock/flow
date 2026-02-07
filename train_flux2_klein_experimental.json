@@ -9,7 +9,7 @@
         "warmup_steps": 50,
         "max_grad_norm": 1.0,
         "save_every": 50,
-        "save_folder": "flux2_klein_checkpoints",
+        "save_folder": "models/klein/flux2_klein_checkpoints_debug",
         "trained_layer_keywords": [
             "double_blocks",
             "single_blocks",
@@ -30,9 +30,10 @@
     },
     "gan": {
         "enabled": true,
+        "noise_mode": "adaptive",
         "discriminator_lr": 1e-5,
-        "gan_loss_weight": 0.1,
-        "replay_buffer_size": 50,
+        "gan_loss_weight": 0.9,
+        "replay_buffer_size": 10000,
         "replay_buffer_prob": 0.8,
         "target_d_loss": 0.693147,
         "noise_ema_decay": 0.95,
@@ -40,9 +41,9 @@
     },
     "inference": {
         "inference_every": 100,
-        "inference_folder": "flux2_inference_outputs",
-        "steps": 28,
-        "cfg": 4.0,
+        "inference_folder": "models/klein/flux2_inference_outputs",
+        "steps": 4,
+        "cfg": 1,
         "first_n_steps_wo_cfg": 0,
         "prompts": [
             "a cute cat sat on a mat while receiving a head pat from his owner called Matt",
@@ -71,7 +72,7 @@
         "offset": 0
     },
     "model": {
-        "klein_path": "models/klein/flux-2-klein-base-4b.safetensors",
+        "klein_path": "models/klein/latest3.safetensors",
         "vae_path": "models/z-image/ae_ch32.safetensors",
         "qwen_path": "models/z-image/text_encoder",
         "qwen_tokenizer_path": "models/z-image/tokenizer",

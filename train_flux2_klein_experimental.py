@@ -93,11 +93,14 @@ class GANConfig:
     discriminator_lr: float = 1e-5
     gan_loss_weight: float = 0.5  # Weight for GAN loss relative to flow matching loss
     
+    # Noise mode: "adaptive" (learned noise level) or "timestep" (use FM timestep as noise)
+    noise_mode: str = "adaptive"  # "adaptive" or "timestep"
+    
     # Replay buffer settings
     replay_buffer_size: int = 50  # Number of samples to store
     replay_buffer_prob: float = 0.8  # Probability of using buffer vs new sample
     
-    # Adaptive noise regularization
+    # Adaptive noise regularization (only used when noise_mode="adaptive")
     target_d_loss: float = 0.693147  # ln(2) - equilibrium point
     noise_ema_decay: float = 0.95  # EMA decay for noise level
     initial_noise_level: float = 1.0  # Start with full noise (discriminator sees pure noise)
@@ -471,6 +474,7 @@ class ReplayBuffer:
                     to_return_latents.append(latent)
                     to_return_texts.append(text)
         
+        print (f"ReplayBuffer: shape {shape_key}, bucket size {len(bucket)}, returned {len(to_return_latents)} samples")
         return torch.cat(to_return_latents, dim=0), torch.cat(to_return_texts, dim=0)
 
     def __len__(self):
@@ -1427,6 +1431,101 @@ class Flux2KleinTrainer(BaseTrainer):
 
         return total_d_loss
 
+    def _train_discriminator_on_gpu_timestep(
+        self,
+        gpu_id: int,
+        encoded_batch: Dict[str, torch.Tensor],
+    ) -> float:
+        """
+        Train discriminator on a single GPU using FM timestep as noise level.
+        
+        Instead of adaptive noise, uses the same timestep that G sees.
+        D sees x0 with noise level = timestep (same distribution G is trained on).
+        
+        Returns D loss value.
+        """
+        device = f'cuda:{gpu_id}'
+        model = self.models[gpu_id]
+        discriminator = self.discriminators[gpu_id]
+        replay_buffer = self.replay_buffers[gpu_id]
+
+        train_mb = self.training_config.train_minibatch
+        num_minibatches = encoded_batch['num_minibatches']
+        
+        total_d_loss = 0.0
+
+        for mb_idx in range(num_minibatches):
+            start = mb_idx * train_mb
+            end = start + train_mb
+            
+            text_embeds = encoded_batch['text_embeds_list'][mb_idx]
+            txt_ids = encoded_batch['txt_ids_list'][mb_idx]
+            real_x0_mb = encoded_batch['real_x0_packed'][start:end].detach()
+            timesteps_mb = encoded_batch['timesteps'][start:end]
+            img_ids_mb = encoded_batch['img_ids'][start:end]
+            noisy_latents_mb = encoded_batch['noisy_latents_packed'][start:end]
+
+            # G forward with no grad to get fake x0
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred_velocity = model(
+                    x=noisy_latents_mb,
+                    x_ids=img_ids_mb,
+                    timesteps=timesteps_mb,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                    guidance=None,
+                )
+                # Convert velocity to x0: x0 = x_t - t * v
+                t_expanded = timesteps_mb[:, None, None]
+                pred_x0 = noisy_latents_mb - t_expanded * pred_velocity
+
+            # D forward/backward
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                # Get fake samples from replay buffer
+                fake_from_buffer, text_from_buffer = replay_buffer.push_and_pop(
+                    pred_x0.detach(), text_embeds.detach()
+                )
+                
+                # Use timestep as noise level (same noise G sees)
+                # Each sample in batch can have different timestep
+                t_for_noise = timesteps_mb  # [B]
+                
+                # Add noise using per-sample timestep
+                real_noise = torch.randn_like(real_x0_mb)
+                fake_noise = torch.randn_like(fake_from_buffer)
+                
+                # Per-sample lerp: x_noisy = (1-t)*x0 + t*noise
+                t_expanded_noise = t_for_noise[:, None, None]
+                # somehow the lerp here is not happy with bfloat16, so we do it in float32 and then cast back
+                real_noisy = torch.lerp(real_x0_mb.float(), real_noise.float(), t_expanded_noise.float())
+                fake_noisy = torch.lerp(fake_from_buffer.float(), fake_noise.float(), t_expanded_noise.float())
+                
+                # D forward conditioned on timestep (same as G's timestep)
+                d_real_scores = discriminator(
+                    x=real_noisy,
+                    x_ids=img_ids_mb,
+                    noise_level=timesteps_mb,  # Use timestep as noise_level
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                )
+                
+                d_fake_scores = discriminator(
+                    x=fake_noisy,
+                    x_ids=img_ids_mb,
+                    noise_level=timesteps_mb,
+                    ctx=text_from_buffer,
+                    ctx_ids=txt_ids,
+                )
+                
+                # Relativistic D loss: D wants real > fake
+                d_relativistic = F.softplus(d_real_scores - d_fake_scores)
+                d_loss = d_relativistic.mean() / num_minibatches
+            
+            d_loss.backward()
+            total_d_loss += d_loss.item()
+
+        return total_d_loss
+
     def _train_generator_on_gpu(
         self,
         gpu_id: int,
@@ -1550,7 +1649,149 @@ class Flux2KleinTrainer(BaseTrainer):
                 fm_grad_normalized = fm_grad / fm_grad_norm
                 g_grad_normalized = g_grad_velocity / g_grad_norm
                 
-                combined_grad = fm_grad_normalized + self.gan_config.gan_loss_weight * g_grad_normalized
+                # Proportional weighting: (1 - w) * FM + w * GAN
+                w = self.gan_config.gan_loss_weight
+                combined_grad = (1.0 - w) * fm_grad_normalized + w * g_grad_normalized
+                combined_grad = combined_grad * fm_grad_norm
+                
+                pred_velocity.backward(combined_grad.detach())
+            else:
+                # No GAN, just FM gradient
+                pred_velocity.backward(fm_grad.detach())
+
+        return {
+            'fm_loss': total_fm_loss,
+            'g_loss': total_g_loss,
+        }
+
+    def _train_generator_on_gpu_timestep(
+        self,
+        gpu_id: int,
+        encoded_batch: Dict[str, torch.Tensor],
+        train_with_gan: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Train generator on a single GPU using FM timestep as noise level for D.
+        
+        Instead of adaptive noise, uses the same timestep that G sees.
+        
+        Returns dict with 'fm_loss' and 'g_loss'.
+        """
+        device = f'cuda:{gpu_id}'
+        model = self.models[gpu_id]
+        discriminator = self.discriminators[gpu_id] if self.discriminators else None
+        grad_eps = self.gan_config.grad_norm_eps
+
+        train_mb = self.training_config.train_minibatch
+        num_minibatches = encoded_batch['num_minibatches']
+        
+        total_fm_loss = 0.0
+        total_g_loss = 0.0
+
+        for mb_idx in range(num_minibatches):
+            start = mb_idx * train_mb
+            end = start + train_mb
+            
+            text_embeds = encoded_batch['text_embeds_list'][mb_idx]
+            txt_ids = encoded_batch['txt_ids_list'][mb_idx]
+            real_x0_mb = encoded_batch['real_x0_packed'][start:end].detach()
+            timesteps_mb = encoded_batch['timesteps'][start:end]
+            img_ids_mb = encoded_batch['img_ids'][start:end]
+            noisy_latents_mb = encoded_batch['noisy_latents_packed'][start:end]
+            target_mb = encoded_batch['target_packed'][start:end]
+            loss_weights = encoded_batch['loss_weights']
+
+            # G forward
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred_velocity = model(
+                    x=noisy_latents_mb,
+                    x_ids=img_ids_mb,
+                    timesteps=timesteps_mb,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                    guidance=None,
+                )
+
+                # FM loss
+                fm_loss_per_sample = ((pred_velocity - target_mb) ** 2).mean(dim=(1, 2))
+                mb_weights = loss_weights[start:end]
+                mb_weights = mb_weights / mb_weights.sum()
+                fm_loss = (fm_loss_per_sample * mb_weights).sum() / num_minibatches
+
+            total_fm_loss += fm_loss.item()
+
+            # Compute FM gradient
+            fm_grad = torch_grad(
+                outputs=fm_loss,
+                inputs=pred_velocity,
+                create_graph=False,
+                retain_graph=True,
+                only_inputs=True,
+            )[0]
+
+            # GAN loss for G
+            if train_with_gan and discriminator is not None:
+                # Convert velocity to x0
+                t_expanded = timesteps_mb[:, None, None]
+                pred_x0 = noisy_latents_mb.detach() - t_expanded * pred_velocity
+                
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    # Use timestep as noise level (same noise G sees)
+                    t_for_noise = timesteps_mb
+                    t_expanded_noise = t_for_noise[:, None, None]
+                    
+                    # Add noise using per-sample timestep
+                    fake_noise = torch.randn_like(pred_x0)
+                    fake_noisy = torch.lerp(pred_x0.float(), fake_noise.float(), t_expanded_noise.float())
+                    
+                    real_noise = torch.randn_like(real_x0_mb)
+                    real_noisy = torch.lerp(real_x0_mb.float(), real_noise.float(), t_expanded_noise.float())
+                    
+                    # D scores for G training (conditioned on timestep)
+                    d_fake_scores = discriminator(
+                        x=fake_noisy,
+                        x_ids=img_ids_mb,
+                        noise_level=timesteps_mb,
+                        ctx=text_embeds,
+                        ctx_ids=txt_ids,
+                    )
+                    
+                    d_real_scores = discriminator(
+                        x=real_noisy.detach(),
+                        x_ids=img_ids_mb,
+                        noise_level=timesteps_mb,
+                        ctx=text_embeds,
+                        ctx_ids=txt_ids,
+                    )
+                    
+                    # G wants fake > real
+                    g_relativistic = F.softplus(d_fake_scores - d_real_scores)
+                    g_loss = g_relativistic.mean() / num_minibatches
+                
+                # Compute G gradient w.r.t. pred_x0
+                g_grad_x0 = torch_grad(
+                    outputs=g_loss,
+                    inputs=pred_x0,
+                    create_graph=False,
+                    retain_graph=False,
+                    only_inputs=True,
+                )[0]
+                
+                # Chain rule: d(x0)/d(v) = -t
+                g_grad_velocity = -t_expanded * g_grad_x0
+                
+                total_g_loss += g_loss.item()
+                
+                # Fuse FM and GAN gradients with normalization
+                fm_grad_norm = fm_grad.norm() + grad_eps
+                g_grad_norm = g_grad_velocity.norm() + grad_eps
+                
+                fm_grad_normalized = fm_grad / fm_grad_norm
+                g_grad_normalized = g_grad_velocity / g_grad_norm
+                
+                # Proportional weighting: (1 - w) * FM + w * GAN
+                w = self.gan_config.gan_loss_weight
+                combined_grad = (1.0 - w) * fm_grad_normalized + w * g_grad_normalized
                 combined_grad = combined_grad * fm_grad_norm
                 
                 pred_velocity.backward(combined_grad.detach())
@@ -1648,6 +1889,8 @@ class Flux2KleinTrainer(BaseTrainer):
         Call this N times, then call step_discriminator() to update weights.
         Following imagenet_gan.py pattern: D, D, D, ... D update
         
+        Dispatches to adaptive or timestep-based training based on noise_mode config.
+        
         Args:
             encoded_batches: Pre-encoded batch from _preprocess_batch()
             
@@ -1657,9 +1900,15 @@ class Flux2KleinTrainer(BaseTrainer):
         if not self.gan_config.enabled or not self.discriminators:
             return 0.0
         
+        # Select training method based on noise mode
+        use_timestep = self.gan_config.noise_mode == "timestep"
+        
         # D forward/backward on all GPUs (accumulates gradients)
         def train_d_on_gpu(gpu_id):
-            return self._train_discriminator_on_gpu(gpu_id, encoded_batches[gpu_id])
+            if use_timestep:
+                return self._train_discriminator_on_gpu_timestep(gpu_id, encoded_batches[gpu_id])
+            else:
+                return self._train_discriminator_on_gpu(gpu_id, encoded_batches[gpu_id])
         
         d_losses = list(self.executor.map(train_d_on_gpu, range(self.n_gpus)))
         total_d_loss = sum(d_losses) / self.n_gpus
@@ -1682,8 +1931,9 @@ class Flux2KleinTrainer(BaseTrainer):
         list(self.executor.map(self._clip_d_grads_on_gpu, range(self.n_gpus)))
         list(self.executor.map(self._d_optimizer_step_on_gpu, range(self.n_gpus)))
         
-        # Update adaptive noise based on D loss
-        self._update_adaptive_noise(avg_d_loss)
+        # Update adaptive noise based on D loss (only in adaptive mode)
+        if self.gan_config.noise_mode == "adaptive":
+            self._update_adaptive_noise(avg_d_loss)
 
     def zero_discriminator_grads(self):
         """Zero discriminator gradients before accumulation."""
@@ -1701,6 +1951,8 @@ class Flux2KleinTrainer(BaseTrainer):
         Call this N times, then call step_generator() to update weights.
         Following imagenet_gan.py pattern: G, G, G, ... G update
         
+        Dispatches to adaptive or timestep-based training based on noise_mode config.
+        
         Args:
             encoded_batches: Pre-encoded batch from _preprocess_batch()
             train_with_gan: Whether to include GAN loss (only when D is strong)
@@ -1708,12 +1960,22 @@ class Flux2KleinTrainer(BaseTrainer):
         Returns:
             Dict with 'fm_loss' and 'g_loss' for this batch
         """
+        # Select training method based on noise mode
+        use_timestep = self.gan_config.noise_mode == "timestep"
+        
         def train_g_on_gpu(gpu_id):
-            return self._train_generator_on_gpu(
-                gpu_id, 
-                encoded_batches[gpu_id],
-                train_with_gan=train_with_gan,
-            )
+            if use_timestep:
+                return self._train_generator_on_gpu_timestep(
+                    gpu_id, 
+                    encoded_batches[gpu_id],
+                    train_with_gan=train_with_gan,
+                )
+            else:
+                return self._train_generator_on_gpu(
+                    gpu_id, 
+                    encoded_batches[gpu_id],
+                    train_with_gan=train_with_gan,
+                )
         
         g_losses = list(self.executor.map(train_g_on_gpu, range(self.n_gpus)))
         
@@ -1898,7 +2160,10 @@ class Flux2KleinTrainer(BaseTrainer):
         if self.gan_config.enabled and self.discriminators:
             for d in self.discriminators:
                 d.train()
-            print(f"GAN training enabled with adaptive noise (initial: {self.noise_lerp_val:.3f})")
+            if self.gan_config.noise_mode == "adaptive":
+                print(f"GAN training enabled with ADAPTIVE noise (initial: {self.noise_lerp_val:.3f})")
+            else:
+                print(f"GAN training enabled with TIMESTEP noise (D sees same noise level as G)")
 
         # Setup profiler
         do_profiling = self.training_config.do_profiling
@@ -1977,12 +2242,18 @@ class Flux2KleinTrainer(BaseTrainer):
                         # -----------------------------------------------------
                         # Phase 2: Train Generator (accumulate then step)
                         # G, G, G, ... G update
-                        # Only train G with GAN loss when D is strong enough
+                        # In adaptive mode: only train G with GAN when D is strong
+                        # In timestep mode: always train with GAN
                         # -----------------------------------------------------
-                        train_g_with_gan = (
-                            self.gan_config.enabled and 
-                            self.prev_d_loss_metric < self.gan_config.target_d_loss
-                        )
+                        if self.gan_config.noise_mode == "timestep":
+                            # Timestep mode: always train with GAN
+                            train_g_with_gan = self.gan_config.enabled
+                        else:
+                            # Adaptive mode: only train G with GAN when D is strong enough
+                            train_g_with_gan = (
+                                self.gan_config.enabled and 
+                                self.prev_d_loss_metric < self.gan_config.target_d_loss
+                            )
                         
                         self.zero_generator_grads()
                         
