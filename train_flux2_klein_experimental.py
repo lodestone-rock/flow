@@ -32,7 +32,7 @@ from torch.profiler import profile, ProfilerActivity, record_function
 from einops import rearrange, repeat
 
 from tqdm import tqdm
-from safetensors.torch import safe_open
+from safetensors.torch import safe_open, save_file as save_safetensors
 
 from transformers import AutoTokenizer, Qwen3ForCausalLM
 from torch.optim import AdamW, RMSprop
@@ -122,6 +122,11 @@ class GANConfig:
     # Example: [1.0, 0.75, 0.5, 0.25] for 4-step, [1.0, 0.5] for 2-step
     # Empty list [] means use continuous sampling (default behavior)
     discrete_timesteps: List[float] = field(default_factory=list)
+    
+    # Discriminator checkpoint path (for resuming training)
+    # If provided, loads discriminator weights from this safetensors file
+    # If empty, initializes discriminator from generator weights
+    discriminator_path: str = ""
 
 
 @dataclass
@@ -1100,7 +1105,7 @@ class Flux2KleinTrainer(BaseTrainer):
             print(f"  Timestep samplers created for {self.n_gpus} GPUs (continuous)")
 
     def _load_discriminator(self):
-        """Load discriminator from Klein model weights and replicate to all GPUs."""
+        """Load discriminator from checkpoint or initialize from generator weights."""
         print("  Loading Discriminator (from Klein architecture)...")
         
         # Select params based on variant (same as generator)
@@ -1113,15 +1118,61 @@ class Flux2KleinTrainer(BaseTrainer):
         
         params.use_gradient_checkpointing = True
         
+        # Load checkpoint state dict if provided
+        checkpoint_state_dict = None
+        if self.gan_config.discriminator_path:
+            print(f"    Loading discriminator checkpoint: {self.gan_config.discriminator_path}")
+            checkpoint_state_dict = load_safetensors(self.gan_config.discriminator_path)
+        
         self.discriminators = []
         for gpu_id in range(self.n_gpus):
             device = f'cuda:{gpu_id}'
             
-            # Create discriminator from generator weights
+            # Create discriminator from generator weights (as base)
             discriminator = Flux2Discriminator.from_flux2(
                 self.models[gpu_id], 
                 params
-            ).to(device).to(torch.bfloat16)
+            )
+            
+            if checkpoint_state_dict is not None:
+                # Load from checkpoint
+                d_state_dict = discriminator.state_dict()
+                loaded_keys = []
+                shape_mismatch_keys = []
+                missing_keys = []
+                
+                for key, tensor in d_state_dict.items():
+                    if key in checkpoint_state_dict:
+                        ckpt_tensor = checkpoint_state_dict[key]
+                        if tensor.shape == ckpt_tensor.shape:
+                            d_state_dict[key] = ckpt_tensor.to(device=device, dtype=torch.bfloat16)
+                            loaded_keys.append(key)
+                        else:
+                            # Shape mismatch - keep the from_flux2 initialized weights
+                            d_state_dict[key] = tensor.to(device=device, dtype=torch.bfloat16)
+                            shape_mismatch_keys.append(
+                                f"{key}: model={list(tensor.shape)} vs ckpt={list(ckpt_tensor.shape)}"
+                            )
+                    else:
+                        # Key not in checkpoint - keep the from_flux2 initialized weights
+                        d_state_dict[key] = tensor.to(device=device, dtype=torch.bfloat16)
+                        missing_keys.append(key)
+                
+                discriminator.load_state_dict(d_state_dict, assign=True)
+                
+                if gpu_id == 0:
+                    print(f"    Loaded: {len(loaded_keys)} keys from checkpoint")
+                    if shape_mismatch_keys:
+                        print(f"    Shape mismatch (kept init): {len(shape_mismatch_keys)} keys")
+                        for key in shape_mismatch_keys[:3]:
+                            print(f"      - {key}")
+                        if len(shape_mismatch_keys) > 3:
+                            print(f"      ... and {len(shape_mismatch_keys) - 3} more")
+                    if missing_keys:
+                        print(f"    Missing in checkpoint (kept init): {len(missing_keys)} keys")
+            else:
+                # No checkpoint - just move to device
+                discriminator = discriminator.to(device).to(torch.bfloat16)
             
             self.discriminators.append(discriminator)
         
@@ -1145,8 +1196,24 @@ class Flux2KleinTrainer(BaseTrainer):
         ]
         
         # Initialize adaptive noise state
-        self.noise_lerp_val = gan_cfg.initial_noise_level
-        self.prev_d_loss_metric = gan_cfg.target_d_loss
+        # Try to load from discriminator state file if resuming
+        state_loaded = False
+        if gan_cfg.discriminator_path:
+            state_path = gan_cfg.discriminator_path.replace('.safetensors', '_state.json')
+            if os.path.exists(state_path):
+                try:
+                    with open(state_path, 'r') as f:
+                        training_state = json.load(f)
+                    self.noise_lerp_val = training_state.get('noise_lerp_val', gan_cfg.initial_noise_level)
+                    self.prev_d_loss_metric = training_state.get('prev_d_loss_metric', gan_cfg.target_d_loss)
+                    state_loaded = True
+                    print(f"    Loaded training state: noise_lerp_val={self.noise_lerp_val:.4f}, prev_d_loss={self.prev_d_loss_metric:.4f}")
+                except Exception as e:
+                    print(f"    Warning: Could not load training state from {state_path}: {e}")
+        
+        if not state_loaded:
+            self.noise_lerp_val = gan_cfg.initial_noise_level
+            self.prev_d_loss_metric = gan_cfg.target_d_loss
         
         print(f"  Replay buffers created for {self.n_gpus} GPUs")
 
@@ -3033,14 +3100,21 @@ class Flux2KleinTrainer(BaseTrainer):
         
         # Save discriminator if GAN enabled
         if self.gan_config.enabled and self.discriminators:
-            d_path = path.replace('.pth', '_discriminator.pth')
-            checkpoint = {
-                'discriminator_state_dict': self.discriminator.state_dict(),
+            # Save discriminator weights as safetensors (for easy loading with load_safetensors)
+            d_path = path.replace('.pth', '_discriminator.safetensors')
+            d_state_dict = {k: v.contiguous() for k, v in self.discriminator.state_dict().items()}
+            save_safetensors(d_state_dict, d_path)
+            print(f"Saved discriminator checkpoint: {d_path}")
+            
+            # Save training state (noise_lerp_val, etc.) separately as JSON
+            state_path = path.replace('.pth', '_discriminator_state.json')
+            training_state = {
                 'noise_lerp_val': self.noise_lerp_val,
                 'prev_d_loss_metric': self.prev_d_loss_metric,
             }
-            torch.save(checkpoint, d_path)
-            print(f"Saved discriminator checkpoint: {d_path}")
+            with open(state_path, 'w') as f:
+                json.dump(training_state, f, indent=2)
+            print(f"Saved discriminator training state: {state_path}")
 
     def _create_dataloader(self) -> DataLoader:
         """Create a new dataloader."""

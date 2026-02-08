@@ -30,6 +30,7 @@
     },
     "gan": {
         "enabled": true,
+        "discriminator_path": "",
         "noise_mode": "adaptive",
         "discrete_timesteps": [1.0, 0.75, 0.5, 0.25],
         "discriminator_lr": 1e-5,
