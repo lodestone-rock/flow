@@ -93,20 +93,35 @@ class GANConfig:
     discriminator_lr: float = 1e-5
     gan_loss_weight: float = 0.5  # Weight for GAN loss relative to flow matching loss
     
-    # Noise mode: "adaptive" (learned noise level) or "timestep" (use FM timestep as noise)
-    noise_mode: str = "adaptive"  # "adaptive" or "timestep"
+    # Noise mode:
+    #   "adaptive" - learned noise level based on D loss (fixed noise at that level)
+    #   "adaptive_uniform" - random uniform noise from 0 to adaptive level (gives D more leeway)
+    #   "timestep" - use FM timestep as noise level
+    #   "gan_only" - pure GAN training (no FM loss), one-step generation with adaptive noise
+    #   "gan_only_uniform" - pure GAN training (no FM loss), one-step with uniform noise [0, adaptive]
+    #   "gan_only_buffer" - pure GAN training, clean samples but adaptive replay buffer prob
+    noise_mode: str = "adaptive"  # "adaptive", "adaptive_uniform", "timestep", "gan_only", "gan_only_uniform", or "gan_only_buffer"
     
     # Replay buffer settings
     replay_buffer_size: int = 50  # Number of samples to store
     replay_buffer_prob: float = 0.8  # Probability of using buffer vs new sample
     
     # Adaptive noise regularization (only used when noise_mode="adaptive")
-    target_d_loss: float = 0.693147  # ln(2) - equilibrium point
+    target_d_loss: float = 0.693147  # ln(2) - equilibrium point (noise_lerp=0 when D loss >= this)
+    target_d_loss_floor: float = 0.0  # D loss at which noise_lerp hits 1.0 (max regularization)
+                                       # Set > 0 to trigger max regularization before D loss hits 0
+                                       # e.g., 0.1 means 100% noise/buffer when D loss <= 0.1
     noise_ema_decay: float = 0.95  # EMA decay for noise level
     initial_noise_level: float = 1.0  # Start with full noise (discriminator sees pure noise)
     
     # Gradient fusion settings
     grad_norm_eps: float = 1e-8  # Epsilon for gradient normalization
+    
+    # Discrete timestep sampling (for few-step distillation)
+    # If non-empty, samples uniformly from these discrete timesteps instead of continuous
+    # Example: [1.0, 0.75, 0.5, 0.25] for 4-step, [1.0, 0.5] for 2-step
+    # Empty list [] means use continuous sampling (default behavior)
+    discrete_timesteps: List[float] = field(default_factory=list)
 
 
 @dataclass
@@ -431,15 +446,24 @@ class ReplayBuffer:
         self,
         x0_latents: torch.Tensor,  # [B, seq, dim]
         text_embeds: torch.Tensor,  # [B, text_seq, text_dim]
+        prob_override: float = None,  # Override default prob (for adaptive buffer)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Push new samples and pop samples for discriminator training.
         
         Returns a mix of new samples and buffered samples from the same shape bucket.
         All samples in a batch have the same shape, so we use one bucket per batch.
+        
+        Args:
+            x0_latents: Latent samples [B, seq, dim]
+            text_embeds: Text embeddings [B, text_seq, text_dim]
+            prob_override: If provided, use this probability instead of self.prob
+                          Higher value = more likely to use NEW samples
+                          Lower value = more likely to use BUFFERED (stale) samples
         """
         device = x0_latents.device
         batch_size = x0_latents.shape[0]
+        use_prob = prob_override if prob_override is not None else self.prob
         
         # Get bucket for this shape
         shape_key = (x0_latents.shape[1], x0_latents.shape[2])
@@ -461,7 +485,7 @@ class ReplayBuffer:
                 to_return_texts.append(text)
             else:
                 # Buffer full, decide whether to use buffer or new sample
-                if torch.rand(1).item() > self.prob:
+                if torch.rand(1).item() > use_prob:
                     # Use sample from buffer (same shape guaranteed)
                     idx = torch.randint(0, len(bucket), (1,)).item()
                     old_latent, old_text = bucket[idx]
@@ -474,7 +498,7 @@ class ReplayBuffer:
                     to_return_latents.append(latent)
                     to_return_texts.append(text)
         
-        print (f"ReplayBuffer: shape {shape_key}, bucket size {len(bucket)}, returned {len(to_return_latents)} samples")
+        print (f"ReplayBuffer: shape {shape_key}, bucket size {len(bucket)}, prob {use_prob:.3f}, returned {len(to_return_latents)} samples")
         return torch.cat(to_return_latents, dim=0), torch.cat(to_return_texts, dim=0)
 
     def __len__(self):
@@ -558,14 +582,23 @@ class BaseTrainer(ABC):
 # =============================================================================
 
 class TimestepSampler:
-    """Handles timestep sampling with custom distribution."""
+    """Handles timestep sampling with custom distribution or discrete steps."""
 
-    def __init__(self, num_points: int = 1000, device: torch.device = None):
+    def __init__(
+        self, 
+        num_points: int = 1000, 
+        device: torch.device = None,
+        discrete_timesteps: List[float] = None,
+    ):
         self.num_points = num_points
         self.device = device
         self._x = None
         self._probabilities = None
         self._cdf = None
+        
+        # Discrete timestep mode
+        self.discrete_timesteps = discrete_timesteps
+        self._discrete_tensor = None
 
     def _build_distribution(self, device: torch.device):
         """Build the timestep distribution (lazy initialization)."""
@@ -576,14 +609,26 @@ class TimestepSampler:
             self._probabilities = self._probabilities.clamp(min=0)
             self._probabilities /= self._probabilities.sum()
             self._cdf = torch.cumsum(self._probabilities, dim=0)
+    
+    def _build_discrete(self, device: torch.device):
+        """Build discrete timestep tensor (lazy initialization)."""
+        if self._discrete_tensor is None or self._discrete_tensor.device != device:
+            self._discrete_tensor = torch.tensor(self.discrete_timesteps, device=device)
 
     def sample(self, num_samples: int, device: torch.device) -> torch.Tensor:
-        """Sample timesteps from the distribution."""
-        self._build_distribution(device)
-        uniform_samples = torch.rand(num_samples, device=device)
-        indices = torch.searchsorted(self._cdf, uniform_samples, right=True)
-        indices = indices.clamp(max=self.num_points - 1)
-        return self._x[indices]
+        """Sample timesteps from the distribution or discrete set."""
+        if self.discrete_timesteps:
+            # Discrete mode: sample uniformly from the discrete timesteps
+            self._build_discrete(device)
+            indices = torch.randint(0, len(self.discrete_timesteps), (num_samples,), device=device)
+            return self._discrete_tensor[indices]
+        else:
+            # Continuous mode: sample from custom distribution
+            self._build_distribution(device)
+            uniform_samples = torch.rand(num_samples, device=device)
+            indices = torch.searchsorted(self._cdf, uniform_samples, right=True)
+            indices = indices.clamp(max=self.num_points - 1)
+            return self._x[indices]
 
 
 # =============================================================================
@@ -1041,8 +1086,18 @@ class Flux2KleinTrainer(BaseTrainer):
     def _setup_timestep_samplers(self):
         """Create one timestep sampler per GPU."""
         print("  Setting up timestep samplers...")
-        self.timestep_samplers = [TimestepSampler() for _ in range(self.n_gpus)]
-        print(f"  Timestep samplers created for {self.n_gpus} GPUs")
+        
+        discrete_ts = self.gan_config.discrete_timesteps if self.gan_config.discrete_timesteps else None
+        
+        self.timestep_samplers = [
+            TimestepSampler(discrete_timesteps=discrete_ts) 
+            for _ in range(self.n_gpus)
+        ]
+        
+        if discrete_ts:
+            print(f"  Timestep samplers created for {self.n_gpus} GPUs (discrete: {discrete_ts})")
+        else:
+            print(f"  Timestep samplers created for {self.n_gpus} GPUs (continuous)")
 
     def _load_discriminator(self):
         """Load discriminator from Klein model weights and replicate to all GPUs."""
@@ -1431,6 +1486,102 @@ class Flux2KleinTrainer(BaseTrainer):
 
         return total_d_loss
 
+    def _train_discriminator_on_gpu_adaptive_uniform(
+        self,
+        gpu_id: int,
+        encoded_batch: Dict[str, torch.Tensor],
+    ) -> float:
+        """
+        Train discriminator on a single GPU with uniform random noise up to adaptive level.
+        
+        Similar to adaptive mode, but instead of fixed noise at noise_lerp_val,
+        samples random noise uniformly from [0, noise_lerp_val] per sample.
+        This gives the discriminator more leeway and variety in noise levels.
+        
+        Returns D loss value.
+        """
+        device = f'cuda:{gpu_id}'
+        model = self.models[gpu_id]
+        discriminator = self.discriminators[gpu_id]
+        replay_buffer = self.replay_buffers[gpu_id]
+        max_noise_level = self.noise_lerp_val  # Upper bound for uniform sampling
+
+        train_mb = self.training_config.train_minibatch
+        num_minibatches = encoded_batch['num_minibatches']
+        
+        total_d_loss = 0.0
+
+        for mb_idx in range(num_minibatches):
+            start = mb_idx * train_mb
+            end = start + train_mb
+            
+            text_embeds = encoded_batch['text_embeds_list'][mb_idx]
+            txt_ids = encoded_batch['txt_ids_list'][mb_idx]
+            real_x0_mb = encoded_batch['real_x0_packed'][start:end].detach()
+            timesteps_mb = encoded_batch['timesteps'][start:end]
+            img_ids_mb = encoded_batch['img_ids'][start:end]
+            noisy_latents_mb = encoded_batch['noisy_latents_packed'][start:end]
+
+            # G forward with no grad to get fake x0
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred_velocity = model(
+                    x=noisy_latents_mb,
+                    x_ids=img_ids_mb,
+                    timesteps=timesteps_mb,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                    guidance=None,
+                )
+                # Convert velocity to x0: x0 = x_t - t * v
+                t_expanded = timesteps_mb[:, None, None]
+                pred_x0 = noisy_latents_mb - t_expanded * pred_velocity
+
+            # D forward/backward
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                # Get fake samples from replay buffer
+                fake_from_buffer, text_from_buffer = replay_buffer.push_and_pop(
+                    pred_x0.detach(), text_embeds.detach()
+                )
+                
+                # Sample uniform noise level per sample: [0, max_noise_level]
+                # Shape: [B] for per-sample noise levels
+                noise_levels = torch.rand(train_mb, device=device) * max_noise_level
+                noise_levels_expanded = noise_levels[:, None, None]  # [B, 1, 1] for broadcasting
+                
+                # Add noise regularization with per-sample noise levels
+                real_noise = torch.randn_like(real_x0_mb)
+                fake_noise = torch.randn_like(fake_from_buffer)
+                
+                # Per-sample lerp with uniform random noise levels
+                real_noisy = torch.lerp(real_x0_mb.float(), real_noise.float(), noise_levels_expanded.float())
+                fake_noisy = torch.lerp(fake_from_buffer.float(), fake_noise.float(), noise_levels_expanded.float())
+                
+                # D forward conditioned on per-sample noise_level
+                d_real_scores = discriminator(
+                    x=real_noisy,
+                    x_ids=img_ids_mb,
+                    noise_level=noise_levels,  # Per-sample noise levels
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                )
+                
+                d_fake_scores = discriminator(
+                    x=fake_noisy,
+                    x_ids=img_ids_mb,
+                    noise_level=noise_levels,
+                    ctx=text_from_buffer,
+                    ctx_ids=txt_ids,
+                )
+                
+                # Relativistic D loss: D wants real > fake
+                d_relativistic = F.softplus(d_real_scores - d_fake_scores)
+                d_loss = d_relativistic.mean() / num_minibatches
+            
+            d_loss.backward()
+            total_d_loss += d_loss.item()
+
+        return total_d_loss
+
     def _train_discriminator_on_gpu_timestep(
         self,
         gpu_id: int,
@@ -1513,6 +1664,99 @@ class Flux2KleinTrainer(BaseTrainer):
                     x=fake_noisy,
                     x_ids=img_ids_mb,
                     noise_level=timesteps_mb,
+                    ctx=text_from_buffer,
+                    ctx_ids=txt_ids,
+                )
+                
+                # Relativistic D loss: D wants real > fake
+                d_relativistic = F.softplus(d_real_scores - d_fake_scores)
+                d_loss = d_relativistic.mean() / num_minibatches
+            
+            d_loss.backward()
+            total_d_loss += d_loss.item()
+
+        return total_d_loss
+
+    def _train_discriminator_on_gpu_gan_only(
+        self,
+        gpu_id: int,
+        encoded_batch: Dict[str, torch.Tensor],
+    ) -> float:
+        """
+        Train discriminator for one-step GAN (no FM loss).
+        
+        G receives pure noise (t=1.0) and outputs x0 directly.
+        D sees real x0 vs G's one-step prediction with adaptive noise regularization.
+        
+        Returns D loss value.
+        """
+        device = f'cuda:{gpu_id}'
+        model = self.models[gpu_id]
+        discriminator = self.discriminators[gpu_id]
+        replay_buffer = self.replay_buffers[gpu_id]
+        noise_level = torch.tensor(self.noise_lerp_val, device=device)
+
+        train_mb = self.training_config.train_minibatch
+        num_minibatches = encoded_batch['num_minibatches']
+        
+        total_d_loss = 0.0
+
+        for mb_idx in range(num_minibatches):
+            start = mb_idx * train_mb
+            end = start + train_mb
+            
+            text_embeds = encoded_batch['text_embeds_list'][mb_idx]
+            txt_ids = encoded_batch['txt_ids_list'][mb_idx]
+            real_x0_mb = encoded_batch['real_x0_packed'][start:end].detach()
+            img_ids_mb = encoded_batch['img_ids'][start:end]
+            
+            # For one-step GAN: G receives pure noise (t=1.0)
+            # Generate fresh noise as input
+            pure_noise = torch.randn_like(real_x0_mb)
+            timestep_one = torch.ones(train_mb, device=device)  # t=1.0
+
+            # G forward with no grad: noise -> x0 in one step
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                # G predicts velocity from pure noise
+                pred_velocity = model(
+                    x=pure_noise,
+                    x_ids=img_ids_mb,
+                    timesteps=timestep_one,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                    guidance=None,
+                )
+                # At t=1.0: x0 = x_t - t * v = noise - 1.0 * v = noise - v
+                pred_x0 = pure_noise - pred_velocity
+
+            # D forward/backward
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                # Get fake samples from replay buffer
+                fake_from_buffer, text_from_buffer = replay_buffer.push_and_pop(
+                    pred_x0.detach(), text_embeds.detach()
+                )
+                
+                # Add adaptive noise regularization to prevent collapse
+                real_noise = torch.randn_like(real_x0_mb)
+                fake_noise = torch.randn_like(fake_from_buffer)
+                
+                real_noisy = torch.lerp(real_x0_mb, real_noise, noise_level)
+                fake_noisy = torch.lerp(fake_from_buffer, fake_noise, noise_level)
+                
+                # D forward on real (with noise)
+                d_real_scores = discriminator(
+                    x=real_noisy,
+                    x_ids=img_ids_mb,
+                    noise_level=noise_level,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                )
+                
+                # D forward on fake (with noise)
+                d_fake_scores = discriminator(
+                    x=fake_noisy,
+                    x_ids=img_ids_mb,
+                    noise_level=noise_level,
                     ctx=text_from_buffer,
                     ctx_ids=txt_ids,
                 )
@@ -1620,6 +1864,148 @@ class Flux2KleinTrainer(BaseTrainer):
                         x=real_noisy.detach(),
                         x_ids=img_ids_mb,
                         noise_level=noise_level,
+                        ctx=text_embeds,
+                        ctx_ids=txt_ids,
+                    )
+                    
+                    # G wants fake > real
+                    g_relativistic = F.softplus(d_fake_scores - d_real_scores)
+                    g_loss = g_relativistic.mean() / num_minibatches
+                
+                # Compute G gradient w.r.t. pred_x0
+                g_grad_x0 = torch_grad(
+                    outputs=g_loss,
+                    inputs=pred_x0,
+                    create_graph=False,
+                    retain_graph=False,
+                    only_inputs=True,
+                )[0]
+                
+                # Chain rule: d(x0)/d(v) = -t
+                g_grad_velocity = -t_expanded * g_grad_x0
+                
+                total_g_loss += g_loss.item()
+                
+                # Fuse FM and GAN gradients with normalization
+                fm_grad_norm = fm_grad.norm() + grad_eps
+                g_grad_norm = g_grad_velocity.norm() + grad_eps
+                
+                fm_grad_normalized = fm_grad / fm_grad_norm
+                g_grad_normalized = g_grad_velocity / g_grad_norm
+                
+                # Proportional weighting: (1 - w) * FM + w * GAN
+                w = self.gan_config.gan_loss_weight
+                combined_grad = (1.0 - w) * fm_grad_normalized + w * g_grad_normalized
+                combined_grad = combined_grad * fm_grad_norm
+                
+                pred_velocity.backward(combined_grad.detach())
+            else:
+                # No GAN, just FM gradient
+                pred_velocity.backward(fm_grad.detach())
+
+        return {
+            'fm_loss': total_fm_loss,
+            'g_loss': total_g_loss,
+        }
+
+    def _train_generator_on_gpu_adaptive_uniform(
+        self,
+        gpu_id: int,
+        encoded_batch: Dict[str, torch.Tensor],
+        train_with_gan: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Train generator on a single GPU with uniform random noise up to adaptive level.
+        
+        Similar to adaptive mode, but samples random noise uniformly from [0, noise_lerp_val]
+        per sample. This gives the discriminator more leeway and variety.
+        
+        Returns dict with 'fm_loss' and 'g_loss'.
+        """
+        device = f'cuda:{gpu_id}'
+        model = self.models[gpu_id]
+        discriminator = self.discriminators[gpu_id] if self.discriminators else None
+        max_noise_level = self.noise_lerp_val  # Upper bound for uniform sampling
+        grad_eps = self.gan_config.grad_norm_eps
+
+        train_mb = self.training_config.train_minibatch
+        num_minibatches = encoded_batch['num_minibatches']
+        
+        total_fm_loss = 0.0
+        total_g_loss = 0.0
+
+        for mb_idx in range(num_minibatches):
+            start = mb_idx * train_mb
+            end = start + train_mb
+            
+            text_embeds = encoded_batch['text_embeds_list'][mb_idx]
+            txt_ids = encoded_batch['txt_ids_list'][mb_idx]
+            real_x0_mb = encoded_batch['real_x0_packed'][start:end].detach()
+            timesteps_mb = encoded_batch['timesteps'][start:end]
+            img_ids_mb = encoded_batch['img_ids'][start:end]
+            noisy_latents_mb = encoded_batch['noisy_latents_packed'][start:end]
+            target_mb = encoded_batch['target_packed'][start:end]
+            loss_weights = encoded_batch['loss_weights']
+
+            # G forward
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred_velocity = model(
+                    x=noisy_latents_mb,
+                    x_ids=img_ids_mb,
+                    timesteps=timesteps_mb,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                    guidance=None,
+                )
+
+                # FM loss
+                fm_loss_per_sample = ((pred_velocity - target_mb) ** 2).mean(dim=(1, 2))
+                mb_weights = loss_weights[start:end]
+                mb_weights = mb_weights / mb_weights.sum()
+                fm_loss = (fm_loss_per_sample * mb_weights).sum() / num_minibatches
+
+            total_fm_loss += fm_loss.item()
+
+            # Compute FM gradient
+            fm_grad = torch_grad(
+                outputs=fm_loss,
+                inputs=pred_velocity,
+                create_graph=False,
+                retain_graph=True,
+                only_inputs=True,
+            )[0]
+
+            # GAN loss for G (only if D is strong enough)
+            if train_with_gan and discriminator is not None:
+                # Convert velocity to x0
+                t_expanded = timesteps_mb[:, None, None]
+                pred_x0 = noisy_latents_mb.detach() - t_expanded * pred_velocity
+                
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    # Sample uniform noise level per sample: [0, max_noise_level]
+                    noise_levels = torch.rand(train_mb, device=device) * max_noise_level
+                    noise_levels_expanded = noise_levels[:, None, None]
+                    
+                    # Add noise regularization with per-sample noise levels
+                    fake_noise = torch.randn_like(pred_x0)
+                    fake_noisy = torch.lerp(pred_x0.float(), fake_noise.float(), noise_levels_expanded.float())
+                    
+                    real_noise = torch.randn_like(real_x0_mb)
+                    real_noisy = torch.lerp(real_x0_mb.float(), real_noise.float(), noise_levels_expanded.float())
+                    
+                    # D scores for G training with per-sample noise levels
+                    d_fake_scores = discriminator(
+                        x=fake_noisy,
+                        x_ids=img_ids_mb,
+                        noise_level=noise_levels,
+                        ctx=text_embeds,
+                        ctx_ids=txt_ids,
+                    )
+                    
+                    d_real_scores = discriminator(
+                        x=real_noisy.detach(),
+                        x_ids=img_ids_mb,
+                        noise_level=noise_levels,
                         ctx=text_embeds,
                         ctx_ids=txt_ids,
                     )
@@ -1804,6 +2190,467 @@ class Flux2KleinTrainer(BaseTrainer):
             'g_loss': total_g_loss,
         }
 
+    def _train_generator_on_gpu_gan_only(
+        self,
+        gpu_id: int,
+        encoded_batch: Dict[str, torch.Tensor],
+        train_with_gan: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Train generator for one-step GAN (no FM loss).
+        
+        G receives pure noise (t=1.0) and learns to output x0 directly.
+        Only GAN loss is used - no flow matching loss.
+        Uses adaptive noise regularization to prevent collapse.
+        
+        Returns dict with 'fm_loss' (always 0) and 'g_loss'.
+        """
+        device = f'cuda:{gpu_id}'
+        model = self.models[gpu_id]
+        discriminator = self.discriminators[gpu_id] if self.discriminators else None
+        noise_level = torch.tensor(self.noise_lerp_val, device=device)
+
+        train_mb = self.training_config.train_minibatch
+        num_minibatches = encoded_batch['num_minibatches']
+        
+        total_g_loss = 0.0
+
+        for mb_idx in range(num_minibatches):
+            start = mb_idx * train_mb
+            end = start + train_mb
+            
+            text_embeds = encoded_batch['text_embeds_list'][mb_idx]
+            txt_ids = encoded_batch['txt_ids_list'][mb_idx]
+            real_x0_mb = encoded_batch['real_x0_packed'][start:end].detach()
+            img_ids_mb = encoded_batch['img_ids'][start:end]
+            
+            # For one-step GAN: G receives pure noise (t=1.0)
+            pure_noise = torch.randn_like(real_x0_mb)
+            timestep_one = torch.ones(train_mb, device=device)  # t=1.0
+
+            # G forward: noise -> x0 in one step
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred_velocity = model(
+                    x=pure_noise,
+                    x_ids=img_ids_mb,
+                    timesteps=timestep_one,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                    guidance=None,
+                )
+                # At t=1.0: x0 = x_t - t * v = noise - v
+                pred_x0 = pure_noise.detach() - pred_velocity
+
+            # GAN loss for G
+            if train_with_gan and discriminator is not None:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    # Add adaptive noise regularization to prevent collapse
+                    fake_noise = torch.randn_like(pred_x0)
+                    fake_noisy = torch.lerp(pred_x0, fake_noise, noise_level)
+                    
+                    real_noise = torch.randn_like(real_x0_mb)
+                    real_noisy = torch.lerp(real_x0_mb, real_noise, noise_level)
+                    
+                    # D scores for G training (with noise)
+                    d_fake_scores = discriminator(
+                        x=fake_noisy,
+                        x_ids=img_ids_mb,
+                        noise_level=noise_level,
+                        ctx=text_embeds,
+                        ctx_ids=txt_ids,
+                    )
+                    
+                    d_real_scores = discriminator(
+                        x=real_noisy.detach(),
+                        x_ids=img_ids_mb,
+                        noise_level=noise_level,
+                        ctx=text_embeds,
+                        ctx_ids=txt_ids,
+                    )
+                    
+                    # G wants fake > real
+                    g_relativistic = F.softplus(d_fake_scores - d_real_scores)
+                    g_loss = g_relativistic.mean() / num_minibatches
+                
+                total_g_loss += g_loss.item()
+                
+                # Direct backward through G (no FM gradient fusion needed)
+                g_loss.backward()
+            else:
+                # No GAN loss - nothing to do (no FM loss in this mode)
+                pass
+
+        return {
+            'fm_loss': 0.0,  # No FM loss in gan_only mode
+            'g_loss': total_g_loss,
+        }
+
+    def _train_discriminator_on_gpu_gan_only_uniform(
+        self,
+        gpu_id: int,
+        encoded_batch: Dict[str, torch.Tensor],
+    ) -> float:
+        """
+        Train discriminator for one-step GAN with uniform random noise.
+        
+        G receives pure noise (t=1.0) and outputs x0 directly.
+        D sees samples with uniform random noise from [0, noise_lerp_val] per sample.
+        This gives D more variety compared to fixed adaptive noise.
+        
+        Returns D loss value.
+        """
+        device = f'cuda:{gpu_id}'
+        model = self.models[gpu_id]
+        discriminator = self.discriminators[gpu_id]
+        replay_buffer = self.replay_buffers[gpu_id]
+        max_noise_level = self.noise_lerp_val  # Upper bound for uniform sampling
+
+        train_mb = self.training_config.train_minibatch
+        num_minibatches = encoded_batch['num_minibatches']
+        
+        total_d_loss = 0.0
+
+        for mb_idx in range(num_minibatches):
+            start = mb_idx * train_mb
+            end = start + train_mb
+            
+            text_embeds = encoded_batch['text_embeds_list'][mb_idx]
+            txt_ids = encoded_batch['txt_ids_list'][mb_idx]
+            real_x0_mb = encoded_batch['real_x0_packed'][start:end].detach()
+            img_ids_mb = encoded_batch['img_ids'][start:end]
+            
+            # For one-step GAN: G receives pure noise (t=1.0)
+            pure_noise = torch.randn_like(real_x0_mb)
+            timestep_one = torch.ones(train_mb, device=device)
+
+            # G forward with no grad: noise -> x0 in one step
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred_velocity = model(
+                    x=pure_noise,
+                    x_ids=img_ids_mb,
+                    timesteps=timestep_one,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                    guidance=None,
+                )
+                pred_x0 = pure_noise - pred_velocity
+
+            # D forward/backward
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                # Get fake samples from replay buffer
+                fake_from_buffer, text_from_buffer = replay_buffer.push_and_pop(
+                    pred_x0.detach(), text_embeds.detach()
+                )
+                
+                # Sample uniform noise level per sample: [0, max_noise_level]
+                noise_levels = torch.rand(train_mb, device=device) * max_noise_level
+                noise_levels_expanded = noise_levels[:, None, None]
+                
+                # Add uniform random noise regularization
+                real_noise = torch.randn_like(real_x0_mb)
+                fake_noise = torch.randn_like(fake_from_buffer)
+                
+                real_noisy = torch.lerp(real_x0_mb.float(), real_noise.float(), noise_levels_expanded.float())
+                fake_noisy = torch.lerp(fake_from_buffer.float(), fake_noise.float(), noise_levels_expanded.float())
+                
+                # D forward with per-sample noise levels
+                d_real_scores = discriminator(
+                    x=real_noisy,
+                    x_ids=img_ids_mb,
+                    noise_level=noise_levels,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                )
+                
+                d_fake_scores = discriminator(
+                    x=fake_noisy,
+                    x_ids=img_ids_mb,
+                    noise_level=noise_levels,
+                    ctx=text_from_buffer,
+                    ctx_ids=txt_ids,
+                )
+                
+                # Relativistic D loss
+                d_relativistic = F.softplus(d_real_scores - d_fake_scores)
+                d_loss = d_relativistic.mean() / num_minibatches
+            
+            d_loss.backward()
+            total_d_loss += d_loss.item()
+
+        return total_d_loss
+
+    def _train_generator_on_gpu_gan_only_uniform(
+        self,
+        gpu_id: int,
+        encoded_batch: Dict[str, torch.Tensor],
+        train_with_gan: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Train generator for one-step GAN with uniform random noise.
+        
+        G receives pure noise (t=1.0) and learns to output x0 directly.
+        D sees samples with uniform random noise from [0, noise_lerp_val] per sample.
+        
+        Returns dict with 'fm_loss' (always 0) and 'g_loss'.
+        """
+        device = f'cuda:{gpu_id}'
+        model = self.models[gpu_id]
+        discriminator = self.discriminators[gpu_id] if self.discriminators else None
+        max_noise_level = self.noise_lerp_val
+
+        train_mb = self.training_config.train_minibatch
+        num_minibatches = encoded_batch['num_minibatches']
+        
+        total_g_loss = 0.0
+
+        for mb_idx in range(num_minibatches):
+            start = mb_idx * train_mb
+            end = start + train_mb
+            
+            text_embeds = encoded_batch['text_embeds_list'][mb_idx]
+            txt_ids = encoded_batch['txt_ids_list'][mb_idx]
+            real_x0_mb = encoded_batch['real_x0_packed'][start:end].detach()
+            img_ids_mb = encoded_batch['img_ids'][start:end]
+            
+            # For one-step GAN: G receives pure noise (t=1.0)
+            pure_noise = torch.randn_like(real_x0_mb)
+            timestep_one = torch.ones(train_mb, device=device)
+
+            # G forward: noise -> x0 in one step
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred_velocity = model(
+                    x=pure_noise,
+                    x_ids=img_ids_mb,
+                    timesteps=timestep_one,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                    guidance=None,
+                )
+                pred_x0 = pure_noise.detach() - pred_velocity
+
+            # GAN loss for G
+            if train_with_gan and discriminator is not None:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    # Sample uniform noise level per sample: [0, max_noise_level]
+                    noise_levels = torch.rand(train_mb, device=device) * max_noise_level
+                    noise_levels_expanded = noise_levels[:, None, None]
+                    
+                    # Add uniform random noise
+                    fake_noise = torch.randn_like(pred_x0)
+                    fake_noisy = torch.lerp(pred_x0.float(), fake_noise.float(), noise_levels_expanded.float())
+                    
+                    real_noise = torch.randn_like(real_x0_mb)
+                    real_noisy = torch.lerp(real_x0_mb.float(), real_noise.float(), noise_levels_expanded.float())
+                    
+                    # D scores for G training with per-sample noise levels
+                    d_fake_scores = discriminator(
+                        x=fake_noisy,
+                        x_ids=img_ids_mb,
+                        noise_level=noise_levels,
+                        ctx=text_embeds,
+                        ctx_ids=txt_ids,
+                    )
+                    
+                    d_real_scores = discriminator(
+                        x=real_noisy.detach(),
+                        x_ids=img_ids_mb,
+                        noise_level=noise_levels,
+                        ctx=text_embeds,
+                        ctx_ids=txt_ids,
+                    )
+                    
+                    # G wants fake > real
+                    g_relativistic = F.softplus(d_fake_scores - d_real_scores)
+                    g_loss = g_relativistic.mean() / num_minibatches
+                
+                total_g_loss += g_loss.item()
+                g_loss.backward()
+            else:
+                pass
+
+        return {
+            'fm_loss': 0.0,
+            'g_loss': total_g_loss,
+        }
+
+    def _train_discriminator_on_gpu_gan_only_buffer(
+        self,
+        gpu_id: int,
+        encoded_batch: Dict[str, torch.Tensor],
+    ) -> float:
+        """
+        Train discriminator for one-step GAN with adaptive replay buffer.
+        
+        G receives pure noise (t=1.0) and outputs x0 directly.
+        D sees clean samples (no noise), but replay buffer probability is adaptive:
+        - When D is too strong: use more stale/buffered samples (lower prob)
+        - When D is too weak: use more fresh samples (higher prob)
+        
+        Returns D loss value.
+        """
+        device = f'cuda:{gpu_id}'
+        model = self.models[gpu_id]
+        discriminator = self.discriminators[gpu_id]
+        replay_buffer = self.replay_buffers[gpu_id]
+        
+        # Adaptive buffer probability: noise_lerp_val controls staleness
+        # High noise_lerp_val (D too strong) -> low prob -> more buffered samples
+        # Low noise_lerp_val (D too weak) -> high prob -> more fresh samples
+        buffer_prob = 1.0 - self.noise_lerp_val  # Invert: high lerp = low prob
+
+        train_mb = self.training_config.train_minibatch
+        num_minibatches = encoded_batch['num_minibatches']
+        
+        total_d_loss = 0.0
+
+        for mb_idx in range(num_minibatches):
+            start = mb_idx * train_mb
+            end = start + train_mb
+            
+            text_embeds = encoded_batch['text_embeds_list'][mb_idx]
+            txt_ids = encoded_batch['txt_ids_list'][mb_idx]
+            real_x0_mb = encoded_batch['real_x0_packed'][start:end].detach()
+            img_ids_mb = encoded_batch['img_ids'][start:end]
+            
+            # For one-step GAN: G receives pure noise (t=1.0)
+            pure_noise = torch.randn_like(real_x0_mb)
+            timestep_one = torch.ones(train_mb, device=device)
+
+            # G forward with no grad: noise -> x0 in one step
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred_velocity = model(
+                    x=pure_noise,
+                    x_ids=img_ids_mb,
+                    timesteps=timestep_one,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                    guidance=None,
+                )
+                pred_x0 = pure_noise - pred_velocity
+
+            # D forward/backward
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                # Get fake samples from replay buffer with adaptive probability
+                fake_from_buffer, text_from_buffer = replay_buffer.push_and_pop(
+                    pred_x0.detach(), text_embeds.detach(),
+                    prob_override=buffer_prob,
+                )
+                
+                # D sees clean samples (no noise regularization)
+                noise_level_zero = torch.zeros(train_mb, device=device)
+                
+                # D forward on real (clean)
+                d_real_scores = discriminator(
+                    x=real_x0_mb,
+                    x_ids=img_ids_mb,
+                    noise_level=noise_level_zero,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                )
+                
+                # D forward on fake (clean, possibly stale from buffer)
+                d_fake_scores = discriminator(
+                    x=fake_from_buffer,
+                    x_ids=img_ids_mb,
+                    noise_level=noise_level_zero,
+                    ctx=text_from_buffer,
+                    ctx_ids=txt_ids,
+                )
+                
+                # Relativistic D loss
+                d_relativistic = F.softplus(d_real_scores - d_fake_scores)
+                d_loss = d_relativistic.mean() / num_minibatches
+            
+            d_loss.backward()
+            total_d_loss += d_loss.item()
+
+        return total_d_loss
+
+    def _train_generator_on_gpu_gan_only_buffer(
+        self,
+        gpu_id: int,
+        encoded_batch: Dict[str, torch.Tensor],
+        train_with_gan: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Train generator for one-step GAN with adaptive replay buffer.
+        
+        G receives pure noise (t=1.0) and learns to output x0 directly.
+        D sees clean samples (no noise regularization).
+        
+        Returns dict with 'fm_loss' (always 0) and 'g_loss'.
+        """
+        device = f'cuda:{gpu_id}'
+        model = self.models[gpu_id]
+        discriminator = self.discriminators[gpu_id] if self.discriminators else None
+
+        train_mb = self.training_config.train_minibatch
+        num_minibatches = encoded_batch['num_minibatches']
+        
+        total_g_loss = 0.0
+
+        for mb_idx in range(num_minibatches):
+            start = mb_idx * train_mb
+            end = start + train_mb
+            
+            text_embeds = encoded_batch['text_embeds_list'][mb_idx]
+            txt_ids = encoded_batch['txt_ids_list'][mb_idx]
+            real_x0_mb = encoded_batch['real_x0_packed'][start:end].detach()
+            img_ids_mb = encoded_batch['img_ids'][start:end]
+            
+            # For one-step GAN: G receives pure noise (t=1.0)
+            pure_noise = torch.randn_like(real_x0_mb)
+            timestep_one = torch.ones(train_mb, device=device)
+
+            # G forward: noise -> x0 in one step
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred_velocity = model(
+                    x=pure_noise,
+                    x_ids=img_ids_mb,
+                    timesteps=timestep_one,
+                    ctx=text_embeds,
+                    ctx_ids=txt_ids,
+                    guidance=None,
+                )
+                pred_x0 = pure_noise.detach() - pred_velocity
+
+            # GAN loss for G
+            if train_with_gan and discriminator is not None:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    # D sees clean samples (no noise)
+                    noise_level_zero = torch.zeros(train_mb, device=device)
+                    
+                    # D scores for G training (G always uses fresh samples)
+                    d_fake_scores = discriminator(
+                        x=pred_x0,
+                        x_ids=img_ids_mb,
+                        noise_level=noise_level_zero,
+                        ctx=text_embeds,
+                        ctx_ids=txt_ids,
+                    )
+                    
+                    d_real_scores = discriminator(
+                        x=real_x0_mb,
+                        x_ids=img_ids_mb,
+                        noise_level=noise_level_zero,
+                        ctx=text_embeds,
+                        ctx_ids=txt_ids,
+                    )
+                    
+                    # G wants fake > real
+                    g_relativistic = F.softplus(d_fake_scores - d_real_scores)
+                    g_loss = g_relativistic.mean() / num_minibatches
+                
+                total_g_loss += g_loss.item()
+                g_loss.backward()
+            else:
+                pass
+
+        return {
+            'fm_loss': 0.0,
+            'g_loss': total_g_loss,
+        }
+
     def _clip_grads_on_gpu(self, gpu_id: int):
         """Clip gradients on generator on a specific GPU."""
         if self.training_config.max_grad_norm > 0:
@@ -1839,11 +2686,25 @@ class Flux2KleinTrainer(BaseTrainer):
             return
             
         target = self.gan_config.target_d_loss
+        floor = self.gan_config.target_d_loss_floor
         ema_decay = self.gan_config.noise_ema_decay
         
-        # Compute raw scale: if D loss < target, D is too strong, increase noise
-        # if D loss > target, D is too weak, decrease noise
-        raw_scale = 1.0 - (avg_d_loss / target)
+        # Compute raw scale with floor:
+        # - D loss >= target: raw_scale = 0.0 (no regularization needed)
+        # - D loss <= floor: raw_scale = 1.0 (max regularization)
+        # - D loss in (floor, target): linear interpolation
+        #
+        # This prevents collapse by hitting max regularization before D loss = 0
+        # e.g., floor=0.1 means 100% noise/buffer when D loss drops to 0.1
+        if avg_d_loss >= target:
+            raw_scale = 0.0
+        elif avg_d_loss <= floor:
+            raw_scale = 1.0
+        else:
+            # Linear interpolation between floor and target
+            # (target - avg_d_loss) / (target - floor) maps [floor, target] -> [1, 0]
+            raw_scale = (target - avg_d_loss) / (target - floor)
+        
         raw_scale = max(0.0, min(1.0, raw_scale))
         
         # EMA update
@@ -1901,13 +2762,21 @@ class Flux2KleinTrainer(BaseTrainer):
             return 0.0
         
         # Select training method based on noise mode
-        use_timestep = self.gan_config.noise_mode == "timestep"
+        noise_mode = self.gan_config.noise_mode
         
         # D forward/backward on all GPUs (accumulates gradients)
         def train_d_on_gpu(gpu_id):
-            if use_timestep:
+            if noise_mode == "gan_only":
+                return self._train_discriminator_on_gpu_gan_only(gpu_id, encoded_batches[gpu_id])
+            elif noise_mode == "gan_only_uniform":
+                return self._train_discriminator_on_gpu_gan_only_uniform(gpu_id, encoded_batches[gpu_id])
+            elif noise_mode == "gan_only_buffer":
+                return self._train_discriminator_on_gpu_gan_only_buffer(gpu_id, encoded_batches[gpu_id])
+            elif noise_mode == "timestep":
                 return self._train_discriminator_on_gpu_timestep(gpu_id, encoded_batches[gpu_id])
-            else:
+            elif noise_mode == "adaptive_uniform":
+                return self._train_discriminator_on_gpu_adaptive_uniform(gpu_id, encoded_batches[gpu_id])
+            else:  # adaptive
                 return self._train_discriminator_on_gpu(gpu_id, encoded_batches[gpu_id])
         
         d_losses = list(self.executor.map(train_d_on_gpu, range(self.n_gpus)))
@@ -1931,8 +2800,8 @@ class Flux2KleinTrainer(BaseTrainer):
         list(self.executor.map(self._clip_d_grads_on_gpu, range(self.n_gpus)))
         list(self.executor.map(self._d_optimizer_step_on_gpu, range(self.n_gpus)))
         
-        # Update adaptive noise based on D loss (only in adaptive mode)
-        if self.gan_config.noise_mode == "adaptive":
+        # Update adaptive noise based on D loss (in adaptive, adaptive_uniform, gan_only, gan_only_uniform, and gan_only_buffer modes)
+        if self.gan_config.noise_mode in ("adaptive", "adaptive_uniform", "gan_only", "gan_only_uniform", "gan_only_buffer"):
             self._update_adaptive_noise(avg_d_loss)
 
     def zero_discriminator_grads(self):
@@ -1961,16 +2830,40 @@ class Flux2KleinTrainer(BaseTrainer):
             Dict with 'fm_loss' and 'g_loss' for this batch
         """
         # Select training method based on noise mode
-        use_timestep = self.gan_config.noise_mode == "timestep"
+        noise_mode = self.gan_config.noise_mode
         
         def train_g_on_gpu(gpu_id):
-            if use_timestep:
+            if noise_mode == "gan_only":
+                return self._train_generator_on_gpu_gan_only(
+                    gpu_id, 
+                    encoded_batches[gpu_id],
+                    train_with_gan=train_with_gan,
+                )
+            elif noise_mode == "gan_only_uniform":
+                return self._train_generator_on_gpu_gan_only_uniform(
+                    gpu_id, 
+                    encoded_batches[gpu_id],
+                    train_with_gan=train_with_gan,
+                )
+            elif noise_mode == "gan_only_buffer":
+                return self._train_generator_on_gpu_gan_only_buffer(
+                    gpu_id, 
+                    encoded_batches[gpu_id],
+                    train_with_gan=train_with_gan,
+                )
+            elif noise_mode == "timestep":
                 return self._train_generator_on_gpu_timestep(
                     gpu_id, 
                     encoded_batches[gpu_id],
                     train_with_gan=train_with_gan,
                 )
-            else:
+            elif noise_mode == "adaptive_uniform":
+                return self._train_generator_on_gpu_adaptive_uniform(
+                    gpu_id, 
+                    encoded_batches[gpu_id],
+                    train_with_gan=train_with_gan,
+                )
+            else:  # adaptive
                 return self._train_generator_on_gpu(
                     gpu_id, 
                     encoded_batches[gpu_id],
@@ -2056,7 +2949,17 @@ class Flux2KleinTrainer(BaseTrainer):
 
             # Get denoising schedule
             image_seq_len = img.shape[1]
-            timesteps = get_schedule(config.steps, image_seq_len)
+            
+            # Use discrete timesteps if configured, otherwise use default schedule
+            if self.gan_config.discrete_timesteps:
+                # Use the discrete timesteps from training config
+                # These should be in descending order (e.g., [1.0, 0.75, 0.5, 0.25])
+                timesteps = list(self.gan_config.discrete_timesteps)
+                # Ensure they end at 0 for final denoising step
+                if timesteps[-1] != 0.0:
+                    timesteps.append(0.0)
+            else:
+                timesteps = get_schedule(config.steps, image_seq_len)
 
             # Encode prompts
             qwen_embed, prompt_masks = text_encoder.encode(prompts)
@@ -2162,8 +3065,16 @@ class Flux2KleinTrainer(BaseTrainer):
                 d.train()
             if self.gan_config.noise_mode == "adaptive":
                 print(f"GAN training enabled with ADAPTIVE noise (initial: {self.noise_lerp_val:.3f})")
-            else:
+            elif self.gan_config.noise_mode == "adaptive_uniform":
+                print(f"GAN training enabled with ADAPTIVE_UNIFORM noise (uniform [0, {self.noise_lerp_val:.3f}])")
+            elif self.gan_config.noise_mode == "timestep":
                 print(f"GAN training enabled with TIMESTEP noise (D sees same noise level as G)")
+            elif self.gan_config.noise_mode == "gan_only":
+                print(f"GAN training enabled with GAN_ONLY mode (one-step generation, no FM loss, adaptive noise: {self.noise_lerp_val:.3f})")
+            elif self.gan_config.noise_mode == "gan_only_uniform":
+                print(f"GAN training enabled with GAN_ONLY_UNIFORM mode (one-step, no FM loss, uniform [0, {self.noise_lerp_val:.3f}])")
+            else:  # gan_only_buffer
+                print(f"GAN training enabled with GAN_ONLY_BUFFER mode (one-step, no FM loss, adaptive buffer prob)")
 
         # Setup profiler
         do_profiling = self.training_config.do_profiling
@@ -2243,10 +3154,10 @@ class Flux2KleinTrainer(BaseTrainer):
                         # Phase 2: Train Generator (accumulate then step)
                         # G, G, G, ... G update
                         # In adaptive mode: only train G with GAN when D is strong
-                        # In timestep mode: always train with GAN
+                        # In timestep/gan_only mode: always train with GAN
                         # -----------------------------------------------------
-                        if self.gan_config.noise_mode == "timestep":
-                            # Timestep mode: always train with GAN
+                        if self.gan_config.noise_mode in ("timestep", "gan_only", "gan_only_uniform", "gan_only_buffer"):
+                            # Timestep/GAN-only modes: always train with GAN
                             train_g_with_gan = self.gan_config.enabled
                         else:
                             # Adaptive mode: only train G with GAN when D is strong enough
