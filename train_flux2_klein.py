@@ -276,7 +276,7 @@ class QwenTextEncoder:
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=True,
+                enable_thinking=False,
             )
             formatted.append(text)
         return formatted
