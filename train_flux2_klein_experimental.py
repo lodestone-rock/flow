@@ -123,6 +123,11 @@ class GANConfig:
     # Empty list [] means use continuous sampling (default behavior)
     discrete_timesteps: List[float] = field(default_factory=list)
     
+    # Discrete noise bins for adaptive noise regularization
+    # If > 0, rounds noise_lerp_val to nearest bin (e.g., 10 bins = [0.0, 0.1, 0.2, ..., 1.0])
+    # If 0, uses continuous noise level (default behavior)
+    noise_discrete_bins: int = 0
+    
     # Discriminator checkpoint path (for resuming training)
     # If provided, loads discriminator weights from this safetensors file
     # If empty, initializes discriminator from generator weights
@@ -2775,7 +2780,19 @@ class Flux2KleinTrainer(BaseTrainer):
         raw_scale = max(0.0, min(1.0, raw_scale))
         
         # EMA update
-        self.noise_lerp_val = (ema_decay * self.noise_lerp_val) + ((1 - ema_decay) * raw_scale)
+        new_noise_lerp = (ema_decay * self.noise_lerp_val) + ((1 - ema_decay) * raw_scale)
+        
+        # Discretize to bins if configured
+        num_bins = self.gan_config.noise_discrete_bins
+        if num_bins > 0:
+            # Round to nearest bin: e.g., 10 bins -> [0.0, 0.1, 0.2, ..., 1.0]
+            # bin_size = 1.0 / num_bins
+            # discretized = round(value / bin_size) * bin_size
+            bin_size = 1.0 / num_bins
+            new_noise_lerp = round(new_noise_lerp / bin_size) * bin_size
+            new_noise_lerp = max(0.0, min(1.0, new_noise_lerp))  # Clamp to [0, 1]
+        
+        self.noise_lerp_val = new_noise_lerp
         self.prev_d_loss_metric = avg_d_loss
 
     def _preprocess_batch(self, batch) -> Tuple[List[Dict], List[str], int]:
