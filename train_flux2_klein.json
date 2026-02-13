@@ -29,7 +29,7 @@
         "aim_experiment_name": "flux2_klein_training"
     },
     "inference": {
-        "inference_every": 100,
+        "inference_every": 1,
         "inference_folder": "flux2_inference_outputs",
         "steps": 28,
         "cfg": 4.0,
@@ -37,6 +37,10 @@
         "prompts": [
             "a cute cat sat on a mat while receiving a head pat from his owner called Matt",
             "baked potato, on the space floating orbiting around the earth"
+        ],
+        "reference_image_paths": [
+            [],
+            []
         ],
         "image_dim": [
             256,
@@ -46,7 +50,7 @@
     },
     "dataloader": {
         "batch_size": 16,
-        "jsonl_metadata_path": "debug_one img.jsonl",
+        "jsonl_metadata_path": "debug_dataloader.jsonl",
         "image_folder_path": "",
         "base_resolution": [
             256
@@ -58,6 +62,8 @@
         "num_workers": 2,
         "prefetch_factor": 4,
         "ratio_cutoff": 2.0,
+        "num_reference_images": 1,
+        "reference_image_t_scale": 10,
         "offset": 0
     },
     "model": {

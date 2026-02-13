@@ -40,7 +40,7 @@ from torch.optim import AdamW
 
 from src.dataloaders.dataloader import TextImageDataset
 from src.models.flux2.model import Flux2, Klein4BParams, Klein9BParams
-from src.models.flux2.sampling import get_schedule, denoise_cfg
+from src.models.flux2.sampling import get_schedule, denoise_cfg, denoise_cfg_with_reference
 from src.models.flux2.autoencoder import AutoEncoder, AutoEncoderParams
 from src.general_utils import load_file_multipart, load_safetensors
 from src.math_utils import cosine_optimal_transport
@@ -96,6 +96,10 @@ class InferenceConfig:
     prompts: List[str] = field(default_factory=lambda: ["a beautiful landscape painting"])
     image_dim: Tuple[int, int] = (512, 512)
     qwen_max_length: int = 512
+    # Reference images for edit mode inference (list of lists, one per prompt)
+    # Each inner list contains paths to reference images for that prompt
+    # Example: [["ref1.png", "ref2.png"], ["ref3.png"]] for 2 prompts
+    reference_image_paths: Optional[List[List[str]]] = None
 
 
 @dataclass
@@ -113,6 +117,9 @@ class DataloaderConfig:
     prefetch_factor: int = 2
     ratio_cutoff: float = 2.0
     offset: int = 0
+    # Image editing settings
+    num_reference_images: Optional[int] = None  # None = disabled, int = number of reference images
+    reference_image_t_scale: int = 10  # T-coordinate scale for reference images (default: 10)
 
 
 @dataclass
@@ -391,21 +398,73 @@ class ExperimentLogger:
 def prepare_img_ids(batch_size: int, height: int, width: int, device: torch.device) -> torch.Tensor:
     """Prepare image position IDs for Flux2 (4D format).
 
-    Flux2 uses 4D position IDs: [dim0, height, width, dim3]
-    Based on original Flux but extended to 4D.
+    Flux2 uses 4D position IDs: [T, height, width, L]
+    - T (dim0): Time/layer index (0 for output latent)
+    - H (dim1): Height position
+    - W (dim2): Width position
+    - L (dim3): Always 0
     """
     # Latent spatial dimensions (16x compression)
     h = math.ceil(height / 16)
     w = math.ceil(width / 16)
 
-    # Create 4D position IDs: [dim0, h, w, dim3]
-    # dim0 and dim3 are set to 0 for image tokens
+    # Create 4D position IDs: [T, h, w, L]
+    # T=0 for output latent tokens
     img_ids = torch.zeros(h, w, 4, device=device)
     img_ids[..., 1] = img_ids[..., 1] + torch.arange(h, device=device)[:, None]
     img_ids[..., 2] = img_ids[..., 2] + torch.arange(w, device=device)[None, :]
     img_ids = repeat(img_ids, "h w c -> b (h w) c", b=batch_size)
 
     return img_ids
+
+
+def prepare_reference_img_ids(
+    reference_latents: List[torch.Tensor],
+    device: torch.device,
+    scale: int = 10,
+) -> torch.Tensor:
+    """Prepare position IDs for reference images (4D format).
+
+    Each reference image gets a unique T-coordinate offset to distinguish it
+    from the output latent (T=0) and from other reference images.
+
+    Args:
+        reference_latents: List of latent tensors [(1, C, H, W), ...]
+        device: Target device
+        scale: T-coordinate scale (default 10). Reference image i gets T = scale + scale * i
+
+    Returns:
+        Combined position IDs tensor [1, total_seq_len, 4]
+    """
+    if not isinstance(reference_latents, list):
+        raise ValueError(f"Expected reference_latents to be a list, got {type(reference_latents)}")
+
+    # Create T-coordinate offsets for each reference image
+    # Image 0 -> T=scale, Image 1 -> T=2*scale, etc.
+    t_coords = [scale + scale * i for i in range(len(reference_latents))]
+
+    all_ids = []
+    for latent, t_val in zip(reference_latents, t_coords):
+        # latent shape: (1, C, H, W)
+        _, _, h, w = latent.shape
+
+        # Create position IDs for this reference image
+        ids = torch.zeros(h, w, 4, device=device)
+        ids[..., 0] = t_val  # T-coordinate (unique per reference image)
+        ids[..., 1] = ids[..., 1] + torch.arange(h, device=device)[:, None]  # H
+        ids[..., 2] = ids[..., 2] + torch.arange(w, device=device)[None, :]  # W
+        # ids[..., 3] = 0  # L (already zero)
+
+        # Flatten spatial dims: (H, W, 4) -> (H*W, 4)
+        ids = ids.view(-1, 4)
+        all_ids.append(ids)
+
+    # Concatenate all reference image IDs: (total_seq_len, 4)
+    combined_ids = torch.cat(all_ids, dim=0)
+    # Add batch dimension: (1, total_seq_len, 4)
+    combined_ids = combined_ids.unsqueeze(0)
+
+    return combined_ids
 
 
 def prepare_txt_ids(batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -762,7 +821,13 @@ class Flux2KleinTrainer(BaseTrainer):
             num_gpus=1,
             ratio_cutoff=self.dataloader_config.ratio_cutoff,
             offset=self.dataloader_config.offset,
+            num_reference_images=self.dataloader_config.num_reference_images,
         )
+
+        # Log edit mode status
+        if self.dataloader_config.num_reference_images is not None:
+            print(f"Edit mode enabled: {self.dataloader_config.num_reference_images} reference images per sample")
+            print(f"Reference image T-scale: {self.dataloader_config.reference_image_t_scale}")
 
     def _all_reduce_gradients(self):
         """All-reduce gradients across all GPU models using NCCL."""
@@ -831,14 +896,81 @@ class Flux2KleinTrainer(BaseTrainer):
 
         return noisy_latents, target, timesteps, img_ids, (b, c, h, w)
 
+    def _prepare_reference_latents(
+        self,
+        reference_images: torch.Tensor,
+        vae: nn.Module,
+        device: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode reference images and prepare them for concatenation.
+
+        Args:
+            reference_images: Reference images [B, num_ref, 3, H, W]
+            vae: VAE encoder
+            device: Target device
+
+        Returns:
+            packed_ref_latents: Packed reference latents [B, total_ref_seq_len, C]
+            ref_img_ids: Reference image position IDs [B, total_ref_seq_len, 4]
+        """
+        b, num_ref, c, h, w = reference_images.shape
+        t_scale = self.dataloader_config.reference_image_t_scale
+
+        all_packed_latents = []
+        all_ref_ids = []
+
+        for batch_idx in range(b):
+            batch_ref_latents = []
+
+            # Encode each reference image for this batch item
+            for ref_idx in range(num_ref):
+                ref_img = reference_images[batch_idx, ref_idx].unsqueeze(0).to(device)  # [1, 3, H, W]
+
+                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    ref_latent = vae.encode(ref_img)  # [1, 128, H/16, W/16]
+
+                batch_ref_latents.append(ref_latent)
+
+            # Prepare position IDs for all reference images in this batch item
+            ref_ids = prepare_reference_img_ids(batch_ref_latents, torch.device(device), scale=t_scale)
+            # ref_ids: [1, total_ref_seq_len, 4]
+
+            # Pack each reference latent and concatenate
+            packed_refs = []
+            for ref_latent in batch_ref_latents:
+                packed, _ = pack_latents(ref_latent)  # [1, H*W, C]
+                packed = packed.squeeze(0)  # [H*W, C]
+                packed_refs.append(packed)
+
+            # Concatenate all reference latents for this batch item
+            packed_refs = torch.cat(packed_refs, dim=0)  # [total_ref_seq_len, C]
+
+            all_packed_latents.append(packed_refs)
+            all_ref_ids.append(ref_ids.squeeze(0))  # [total_ref_seq_len, 4]
+
+        # Stack across batch dimension
+        packed_ref_latents = torch.stack(all_packed_latents, dim=0)  # [B, total_ref_seq_len, C]
+        ref_img_ids = torch.stack(all_ref_ids, dim=0)  # [B, total_ref_seq_len, 4]
+
+        return packed_ref_latents, ref_img_ids
+
     def _forward_backward_on_gpu(
         self,
         gpu_id: int,
         images_chunk: torch.Tensor,
         captions_chunk: List[str],
         loss_weights_chunk: List[float],
+        reference_images_chunk: Optional[torch.Tensor] = None,
     ) -> float:
-        """Run forward/backward pass on a single GPU with its data chunk."""
+        """Run forward/backward pass on a single GPU with its data chunk.
+
+        Args:
+            gpu_id: GPU index
+            images_chunk: Target images [B, 3, H, W]
+            captions_chunk: List of captions
+            loss_weights_chunk: List of loss weights
+            reference_images_chunk: Optional reference images [B, num_ref, 3, H, W]
+        """
         device = f'cuda:{gpu_id}'
         model = self.models[gpu_id]
         vae = self.vaes[gpu_id]
@@ -847,7 +979,7 @@ class Flux2KleinTrainer(BaseTrainer):
         batch_size = images_chunk.shape[0]
         cache_mb = self.training_config.cache_minibatch
 
-        # Encode images to latents in chunks to save memory
+        # Encode target images to latents in chunks to save memory
         latents_list = []
         for i in range(0, batch_size, cache_mb):
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -865,6 +997,15 @@ class Flux2KleinTrainer(BaseTrainer):
         # Pack latents for transformer: [B, C, H, W] -> [B, H*W, C]
         noisy_latents_packed, _ = pack_latents(noisy_latents)
         target_packed, _ = pack_latents(target)
+
+        # Prepare reference image latents if provided (edit mode)
+        ref_latents_packed = None
+        ref_img_ids = None
+        if reference_images_chunk is not None:
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                ref_latents_packed, ref_img_ids = self._prepare_reference_latents(
+                    reference_images_chunk, vae, device
+                )
 
         noisy_latents_packed.requires_grad_(True)
 
@@ -886,16 +1027,38 @@ class Flux2KleinTrainer(BaseTrainer):
             # Prepare text position IDs
             txt_ids = prepare_txt_ids(train_mb, text_embeds.shape[1], torch.device(device))
 
+            # Prepare model input (concatenate with reference latents if in edit mode)
+            mb_noisy_latents = noisy_latents_packed[start:end]
+            mb_img_ids = img_ids[start:end]
+
+            if ref_latents_packed is not None:
+                # Concatenate reference latents along sequence dimension
+                # [B, output_seq_len, C] + [B, ref_seq_len, C] -> [B, total_seq_len, C]
+                mb_ref_latents = ref_latents_packed[start:end]
+                mb_ref_ids = ref_img_ids[start:end]
+
+                model_input = torch.cat([mb_noisy_latents, mb_ref_latents], dim=1)
+                model_input_ids = torch.cat([mb_img_ids, mb_ref_ids], dim=1)
+                output_seq_len = mb_noisy_latents.shape[1]
+            else:
+                model_input = mb_noisy_latents
+                model_input_ids = mb_img_ids
+                output_seq_len = None
+
             # Forward pass
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 pred = model(
-                    x=noisy_latents_packed[start:end],
-                    x_ids=img_ids[start:end],
+                    x=model_input,
+                    x_ids=model_input_ids,
                     timesteps=timesteps[start:end],
                     ctx=text_embeds,
                     ctx_ids=txt_ids,
                     guidance=None,  # Klein models don't use guidance embedding
                 )
+
+                # Extract only output tokens (exclude reference tokens) if in edit mode
+                if output_seq_len is not None:
+                    pred = pred[:, :output_seq_len, :]
 
                 # Compute loss (MSE between predicted velocity and target velocity)
                 loss = ((pred - target_packed[start:end]) ** 2).mean(dim=(1, 2))
@@ -925,8 +1088,16 @@ class Flux2KleinTrainer(BaseTrainer):
         self.optimizers[gpu_id].zero_grad()
 
     def train_step(self, batch) -> float:
-        """Execute forward/backward pass across all GPUs (without all-reduce)."""
-        images, captions, _, loss_weights = batch
+        """Execute forward/backward pass across all GPUs (without all-reduce).
+
+        Supports both text-to-image and image editing modes.
+        """
+        # Handle both formats: with and without reference images
+        if len(batch) == 5:
+            images, captions, _, loss_weights, reference_images = batch
+        else:
+            images, captions, _, loss_weights = batch
+            reference_images = None
 
         # Preprocess captions
         captions = [c if c else "" for c in captions]
@@ -939,11 +1110,17 @@ class Flux2KleinTrainer(BaseTrainer):
         def gpu_forward_backward(gpu_id):
             start = gpu_id * samples_per_gpu
             end = start + samples_per_gpu
+
+            ref_chunk = None
+            if reference_images is not None:
+                ref_chunk = reference_images[start:end]
+
             return self._forward_backward_on_gpu(
                 gpu_id=gpu_id,
                 images_chunk=images[start:end],
                 captions_chunk=captions[start:end],
                 loss_weights_chunk=loss_weights[start:end],
+                reference_images_chunk=ref_chunk,
             )
 
         # Forward/backward on all GPUs in parallel
@@ -957,8 +1134,16 @@ class Flux2KleinTrainer(BaseTrainer):
         gpu_id: int,
         prompts: List[str],
         config: InferenceConfig,
+        reference_images: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Run inference on a single GPU."""
+        """Run inference on a single GPU.
+
+        Args:
+            gpu_id: GPU index
+            prompts: List of prompts
+            config: Inference configuration
+            reference_images: Optional list of reference image tensors [3, H, W] for edit mode
+        """
         device = f'cuda:{gpu_id}'
         model = self.models[gpu_id]
         text_encoder = self.text_encoders[gpu_id]
@@ -1000,8 +1185,33 @@ class Flux2KleinTrainer(BaseTrainer):
             txt_ids = prepare_txt_ids(batch_size, qwen_embed.shape[1], device)
             neg_txt_ids = prepare_txt_ids(batch_size, qwen_embed_neg.shape[1], device)
 
-            # Run denoising with CFG
-            output_latent = denoise_cfg(
+            # Prepare reference image latents if provided (edit mode inference)
+            ref_latents = None
+            ref_ids = None
+            if reference_images is not None and len(reference_images) > 0:
+                t_scale = self.dataloader_config.reference_image_t_scale
+                ref_latent_list = []
+
+                for ref_img in reference_images:
+                    ref_img = ref_img.unsqueeze(0).to(device)  # [1, 3, H, W]
+                    ref_latent = ae.encode(ref_img)  # [1, 128, H/16, W/16]
+                    ref_latent_list.append(ref_latent)
+
+                # Prepare reference position IDs
+                ref_ids = prepare_reference_img_ids(ref_latent_list, torch.device(device), scale=t_scale)
+                ref_ids = ref_ids.expand(batch_size, -1, -1)  # [B, ref_seq_len, 4]
+
+                # Pack and concatenate reference latents
+                packed_refs = []
+                for ref_latent in ref_latent_list:
+                    packed, _ = pack_latents(ref_latent)  # [1, H*W, C]
+                    packed = packed.squeeze(0)  # [H*W, C]
+                    packed_refs.append(packed)
+                ref_latents = torch.cat(packed_refs, dim=0)  # [total_ref_seq_len, C]
+                ref_latents = ref_latents.unsqueeze(0).expand(batch_size, -1, -1)  # [B, ref_seq_len, C]
+
+            # Run denoising with CFG (with optional reference images)
+            output_latent = denoise_cfg_with_reference(
                 model,
                 img,
                 img_ids,
@@ -1012,6 +1222,8 @@ class Flux2KleinTrainer(BaseTrainer):
                 timesteps,
                 cfg=config.cfg,
                 first_n_steps_without_cfg=config.first_n_steps_wo_cfg,
+                ref_latents=ref_latents,
+                ref_ids=ref_ids,
             )
 
             # Unpack and decode
@@ -1025,23 +1237,106 @@ class Flux2KleinTrainer(BaseTrainer):
         """Set model back to train mode on a specific GPU."""
         self.models[gpu_id].train()
 
+    def _load_reference_images_for_inference(
+        self,
+        ref_paths: List[str],
+        target_height: int,
+        target_width: int,
+    ) -> List[torch.Tensor]:
+        """Load and preprocess reference images for inference.
+
+        Args:
+            ref_paths: List of paths to reference images
+            target_height: Target height for resizing
+            target_width: Target width for resizing
+
+        Returns:
+            List of preprocessed image tensors [3, H, W]
+        """
+        from PIL import Image as PILImageLoader
+        import torchvision.transforms.v2 as v2
+
+        transform = v2.Compose([
+            v2.ToTensor(),
+            v2.Normalize(mean=[0.5], std=[0.5]),
+        ])
+
+        ref_tensors = []
+        for path in ref_paths:
+            try:
+                img = PILImageLoader.open(path).convert("RGB")
+                # Resize to target dimensions
+                img = img.resize((target_width, target_height), PILImageLoader.LANCZOS)
+                tensor = transform(img)
+                ref_tensors.append(tensor)
+            except Exception as e:
+                print(f"Warning: Failed to load reference image {path}: {e}")
+
+        return ref_tensors
+
     @torch.no_grad()
-    def run_inference(self, extra_prompts_per_gpu: List[str] = None) -> torch.Tensor:
+    def run_inference(
+        self,
+        extra_prompts_per_gpu: List[str] = None,
+        extra_reference_images_per_gpu: List[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
         """
         Run inference to generate sample images across multiple GPUs.
         Each GPU generates: (inference prompts + 1 extra prompt from batch)
 
         Args:
             extra_prompts_per_gpu: One extra prompt per GPU (e.g., from training batch)
+            extra_reference_images_per_gpu: Reference images for extra prompts (edit mode)
         """
         config = self.inference_config
         base_prompts = list(config.prompts)
+        width, height = config.image_dim
+
+        # Load reference images from config if specified (for edit mode)
+        base_reference_images = []
+        if config.reference_image_paths is not None:
+            for prompt_idx, ref_paths in enumerate(config.reference_image_paths):
+                if ref_paths:
+                    ref_tensors = self._load_reference_images_for_inference(
+                        ref_paths, height, width
+                    )
+                    base_reference_images.append(ref_tensors)
+                else:
+                    base_reference_images.append([])
 
         def inference_on_gpu(gpu_id):
             prompts = list(base_prompts)
+            reference_images = list(base_reference_images) if base_reference_images else None
+
+            # Add extra prompt and its reference images if provided
             if extra_prompts_per_gpu and gpu_id < len(extra_prompts_per_gpu):
                 prompts.append(extra_prompts_per_gpu[gpu_id])
-            return self._inference_on_gpu(gpu_id, prompts, config)
+                # Add reference images for extra prompt if provided
+                if extra_reference_images_per_gpu and gpu_id < len(extra_reference_images_per_gpu):
+                    if reference_images is None:
+                        reference_images = [[] for _ in range(len(base_prompts))]
+                    reference_images.append(extra_reference_images_per_gpu[gpu_id])
+                elif reference_images is not None:
+                    reference_images.append([])  # No reference for extra prompt
+
+            # For edit mode, we need to run inference one prompt at a time
+            # since each prompt may have different reference images
+            if reference_images is not None and any(len(refs) > 0 for refs in reference_images):
+                # Edit mode: run each prompt separately with its reference images
+                all_outputs = []
+                for prompt_idx, prompt in enumerate(prompts):
+                    refs = reference_images[prompt_idx] if prompt_idx < len(reference_images) else []
+                    output = self._inference_on_gpu(
+                        gpu_id,
+                        [prompt],
+                        config,
+                        reference_images=refs if refs else None,
+                    )
+                    all_outputs.append(output)
+                return torch.cat(all_outputs, dim=0)
+            else:
+                # Text-to-image mode: batch all prompts together
+                return self._inference_on_gpu(gpu_id, prompts, config)
 
         # Run inference on all GPUs in parallel
         results = list(self.executor.map(inference_on_gpu, range(self.n_gpus)))
@@ -1151,13 +1446,29 @@ class Flux2KleinTrainer(BaseTrainer):
                         # Get one prompt per GPU from current batch
                         captions = batch_data[1]
                         extra_prompts_per_gpu = []
+                        extra_reference_images_per_gpu = []
+
+                        # Check if we have reference images in the batch (edit mode)
+                        has_batch_refs = len(batch_data) == 5 and batch_data[4] is not None
+
                         if captions:
                             samples_per_gpu = len(captions) // self.n_gpus
                             for gpu_id in range(self.n_gpus):
                                 idx = gpu_id * samples_per_gpu
                                 if idx < len(captions) and captions[idx]:
                                     extra_prompts_per_gpu.append(captions[idx])
-                        images = self.run_inference(extra_prompts_per_gpu=extra_prompts_per_gpu)
+                                    # Get reference images for this sample if available
+                                    if has_batch_refs:
+                                        # batch_data[4] is [B, num_ref, 3, H, W]
+                                        ref_imgs = batch_data[4][idx]  # [num_ref, 3, H, W]
+                                        # Convert to list of tensors
+                                        ref_list = [ref_imgs[i] for i in range(ref_imgs.shape[0])]
+                                        extra_reference_images_per_gpu.append(ref_list)
+
+                        images = self.run_inference(
+                            extra_prompts_per_gpu=extra_prompts_per_gpu,
+                            extra_reference_images_per_gpu=extra_reference_images_per_gpu if extra_reference_images_per_gpu else None,
+                        )
 
                         output_path = f"{self.inference_config.inference_folder}/{self.global_step}.png"
                         save_image(
