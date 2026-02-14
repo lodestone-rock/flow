@@ -1,0 +1,71 @@
+{
+    "training": {
+        "master_seed": 2000,
+        "cache_minibatch": 8,
+        "train_minibatch": 8,
+        "gradient_accumulation_steps": 1,
+        "lr": 1e-04,
+        "weight_decay": 0.01,
+        "warmup_steps": 100,
+        "max_grad_norm": 1.0,
+        "save_every": 100,
+        "save_folder": "/mnt/datapool_u2/models/z-image-pixelspace",
+        "pixel_patch_size": 32,
+        "trained_layer_keywords": [
+            "x_embedder",
+            "t_embedder",
+            "cap_embedder",
+            "noise_refiner",
+            "context_refiner",
+            "dec_net"
+        ],
+        "use_aim": false,
+        "aim_path": "aim://localhost:4893",
+        "aim_experiment_name": "z-image-pixelspace",
+        "do_profiling": false,
+        "profile_steps": 7,
+        "profile_json_dump": "grad_accum_4.json",
+        "dino_loss_strength": 0.0,
+        "dino_model_name": "",
+        "dino_timestep_threshold": 0.3,
+        "lpips_loss_strength": 0.0,
+        "lpips_net": "vgg",
+        "lpips_convnext_model": "",
+        "lpips_timestep_threshold": 0.3
+    
+    },
+    "inference": {
+        "inference_every": 25,
+        "inference_folder": "preview_pixelspace",
+        "steps": 20,
+        "cfg": 3,
+        "prompts": [
+            "a cute cat sat on a mat while receiving a head pat from his owner called Matt",
+            "baked potato, on the space floating orbiting around the earth"
+        ],
+        "first_n_steps_wo_cfg": 0,
+        "image_dim": [512, 512],
+        "max_sequence_length": 512
+    },
+    "dataloader": {
+        "batch_size": 256,
+        "jsonl_metadata_path": "fast_training_weighted_blackblaze.jsonl",
+        "image_folder_path": "",
+        "base_resolution": [512],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.3,
+        "uncond_percentage": 0.1,
+        "resolution_step": 64,
+        "num_workers": 4,
+        "prefetch_factor": 2,
+        "ratio_cutoff": 2.0,
+        "offset": 0
+    },
+    "model": {
+        "z_image_path": "models/z-image-pixelspace/zeta-chroma-base-x0-pixel-proto.safetensors",
+        "qwen_path": "/mnt/datapool_u2/models/z-image/text_encoder",
+        "qwen_tokenizer_path": "/mnt/datapool_u2/models/z-image/tokenizer",
+        "max_sequence_length": 512,
+        "use_x0": true
+    }
+}

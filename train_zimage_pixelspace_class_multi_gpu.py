@@ -45,6 +45,21 @@ from src.models.zimage.utils import (
     make_text_position_ids,
 )
 
+# Optional perceptual losses
+try:
+    import lpips
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
+    print("Warning: lpips not installed. LPIPS loss will be disabled.")
+
+# DINOv3 support via transformers
+try:
+    from transformers import AutoImageProcessor, AutoModel as HFAutoModel
+    DINOV3_AVAILABLE = True
+except ImportError:
+    DINOV3_AVAILABLE = False
+    print("Warning: transformers not installed. DINOv3 will not be available.")
 
 
 # Optional: Aim for experiment tracking
@@ -88,10 +103,45 @@ class TrainingConfig:
     aim_path: Optional[str] = None
     aim_experiment_name: Optional[str] = None
     
+    # Perceptual loss settings
+    # DINOv3 embedding similarity loss (0.0 = disabled)
+    dino_loss_strength: float = 0.0
+    # DINOv3 options: facebook/dinov3-vits16-pretrain-lvd1689m, facebook/dinov3-vitb16-pretrain-lvd1689m,
+    #                 facebook/dinov3-vitl16-pretrain-lvd1689m, facebook/dinov3-vith16plus-pretrain-lvd1689m,
+    #                 facebook/dinov3-vit7b16-pretrain-lvd1689m
+    dino_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
+    dino_timestep_threshold: float = 0.5  # Only apply when timestep < threshold (closer to clean image)
+    
+    # Perceptual reconstruction loss (0.0 = disabled)
+    # Can use either legacy LPIPS or DINOv3 ConvNeXt (recommended)
+    lpips_loss_strength: float = 0.0
+    lpips_net: str = "dinov3-convnext"  # Options: dinov3-convnext (recommended), alex, vgg, squeeze
+    # DINOv3 ConvNeXt options: facebook/dinov3-convnext-tiny-pretrain-lvd1689m,
+    #                         facebook/dinov3-convnext-small-pretrain-lvd1689m,
+    #                         facebook/dinov3-convnext-base-pretrain-lvd1689m,
+    #                         facebook/dinov3-convnext-large-pretrain-lvd1689m
+    lpips_convnext_model: str = "facebook/dinov3-convnext-base-pretrain-lvd1689m"
+    lpips_timestep_threshold: float = 0.5  # Only apply when timestep < threshold
+    
     @property
     def pixel_in_channels(self) -> int:
         """Derived: patch_size * patch_size * 3 (RGB)."""
         return self.pixel_patch_size * self.pixel_patch_size * 3
+    
+    @property
+    def use_dino_loss(self) -> bool:
+        """Whether DINOv3 loss is enabled."""
+        return self.dino_loss_strength > 0.0
+    
+    @property
+    def use_lpips_loss(self) -> bool:
+        """Whether perceptual reconstruction loss is enabled."""
+        return self.lpips_loss_strength > 0.0
+    
+    @property
+    def use_convnext_lpips(self) -> bool:
+        """Whether using DINOv3 ConvNeXt instead of legacy LPIPS."""
+        return self.lpips_net == "dinov3-convnext"
 
 
 @dataclass
@@ -432,6 +482,11 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         # Shared tokenizer (CPU-based, thread-safe)
         self.tokenizer = None
         self.timestep_samplers = []  # One per GPU
+        
+        # Perceptual loss models (one per GPU)
+        self.dino_models = []  # DINOv3 ViT models (for embedding similarity)
+        self.dino_processors = []  # DINOv3 image processors
+        self.lpips_models = []  # Perceptual models (DINOv3 ConvNeXt or legacy LPIPS)
     
     def _parse_configs(self):
         """Parse configuration into dataclasses."""
@@ -484,6 +539,9 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         
         # Create timestep samplers (one per GPU)
         self._setup_timestep_samplers()
+        
+        # Load perceptual loss models if enabled
+        self._load_perceptual_loss_models()
         
         print("All models loaded!")
     
@@ -648,6 +706,79 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         self.timestep_samplers = [TimestepSampler() for _ in range(self.n_gpus)]
         print(f"  Timestep samplers created for {self.n_gpus} GPUs")
     
+    def _load_perceptual_loss_models(self):
+        """Load DINOv3 and LPIPS models if enabled."""
+        # Load DINOv3 models
+        if self.training_config.use_dino_loss:
+            if not DINOV3_AVAILABLE:
+                print("  Warning: DINOv3 requested but transformers not installed. Disabling DINO loss.")
+                self.training_config.dino_loss_strength = 0.0
+            else:
+                model_name = self.training_config.dino_model_name
+                print(f"  Loading DINOv3 ({model_name})...")
+                self.dino_models = []
+                self.dino_processors = []
+                
+                # Load processor once (it's the same for all GPUs)
+                processor = AutoImageProcessor.from_pretrained(model_name)
+                
+                for gpu_id in range(self.n_gpus):
+                    device = f'cuda:{gpu_id}'
+                    # Load DINOv3 from HuggingFace
+                    dino = HFAutoModel.from_pretrained(
+                        model_name,
+                        torch_dtype=torch.bfloat16,
+                    ).to(device)
+                    dino.eval()
+                    for param in dino.parameters():
+                        param.requires_grad = False
+                    self.dino_models.append(dino)
+                    self.dino_processors.append(processor)
+                print(f"  DINOv3 loaded on {self.n_gpus} GPUs (threshold: t < {self.training_config.dino_timestep_threshold})")
+        else:
+            print("  DINOv3 loss disabled (strength = 0)")
+        
+        # Load perceptual reconstruction models (DINOv3 ConvNeXt or legacy LPIPS)
+        if self.training_config.use_lpips_loss:
+            if self.training_config.use_convnext_lpips:
+                # Use DINOv3 ConvNeXt (recommended - modern and efficient)
+                if not DINOV3_AVAILABLE:
+                    print("  Warning: DINOv3 ConvNeXt requested but transformers not installed. Disabling perceptual loss.")
+                    self.training_config.lpips_loss_strength = 0.0
+                else:
+                    model_name = self.training_config.lpips_convnext_model
+                    print(f"  Loading DINOv3 ConvNeXt for perceptual loss ({model_name})...")
+                    self.lpips_models = []
+                    for gpu_id in range(self.n_gpus):
+                        device = f'cuda:{gpu_id}'
+                        convnext = HFAutoModel.from_pretrained(
+                            model_name,
+                            torch_dtype=torch.bfloat16,
+                        ).to(device)
+                        convnext.eval()
+                        for param in convnext.parameters():
+                            param.requires_grad = False
+                        self.lpips_models.append(convnext)
+                    print(f"  DINOv3 ConvNeXt loaded on {self.n_gpus} GPUs (threshold: t < {self.training_config.lpips_timestep_threshold})")
+            else:
+                # Use legacy LPIPS (VGG/Alex/Squeeze)
+                if not LPIPS_AVAILABLE:
+                    print("  Warning: LPIPS requested but not installed. Disabling perceptual loss.")
+                    self.training_config.lpips_loss_strength = 0.0
+                else:
+                    print(f"  Loading legacy LPIPS ({self.training_config.lpips_net})...")
+                    self.lpips_models = []
+                    for gpu_id in range(self.n_gpus):
+                        device = f'cuda:{gpu_id}'
+                        lpips_model = lpips.LPIPS(net=self.training_config.lpips_net).to(device)
+                        lpips_model.eval()
+                        for param in lpips_model.parameters():
+                            param.requires_grad = False
+                        self.lpips_models.append(lpips_model)
+                    print(f"  Legacy LPIPS loaded on {self.n_gpus} GPUs (threshold: t < {self.training_config.lpips_timestep_threshold})")
+        else:
+            print("  Perceptual reconstruction loss disabled (strength = 0)")
+    
     def _load_state_dict(self, path: str) -> Dict[str, torch.Tensor]:
         """Load state dict from file."""
         if path.endswith((".safetensors", ".sft")):
@@ -752,14 +883,145 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         if self.logger:
             self.logger.close()
     
+    def _compute_perceptual_losses(
+        self,
+        gpu_id: int,
+        pred_x0_patches: torch.Tensor,
+        gt_clean_patches: torch.Tensor,
+        timesteps: torch.Tensor,
+        pixel_shape: Tuple[int, int, int, int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute DINOv3 and LPIPS perceptual losses.
+        
+        The model internally predicts x0 (clean image) and converts to velocity.
+        We pass the x0 predictions directly here to avoid redundant reconstruction.
+        
+        Args:
+            gpu_id: GPU index
+            pred_x0_patches: Predicted clean patches [B, num_patches, channels] (x0 prediction)
+            gt_clean_patches: Ground truth clean patches [B, num_patches, channels]
+            timesteps: Timestep values [B]
+            pixel_shape: Original image shape (B, C, H, W)
+            
+        Returns:
+            dino_loss: DINOv3 embedding similarity loss [B] or zeros if disabled
+            lpips_loss: LPIPS reconstruction loss [B] or zeros if disabled
+        """
+        device = f'cuda:{gpu_id}'
+        patch_size = self.training_config.pixel_patch_size
+        batch_size = pred_x0_patches.shape[0]
+        
+        dino_loss = torch.zeros(batch_size, device=device)
+        lpips_loss = torch.zeros(batch_size, device=device)
+        
+        # Unpatchify to image space for perceptual losses
+        # No reconstruction needed - we receive x0 directly
+        pred_clean_images = vae_unflatten(pred_x0_patches.float(), pixel_shape, patch_size=patch_size)
+        gt_clean_images = vae_unflatten(gt_clean_patches.float(), pixel_shape, patch_size=patch_size)
+        
+        # Clamp images to valid range
+        pred_clean_images = pred_clean_images.clamp(-1, 1)
+        gt_clean_images = gt_clean_images.clamp(-1, 1)
+        
+        # DINOv3 loss: embedding similarity
+        if self.training_config.use_dino_loss and self.dino_models:
+            dino_model = self.dino_models[gpu_id]
+            dino_threshold = self.training_config.dino_timestep_threshold
+            
+            # Only compute for samples below timestep threshold
+            dino_mask = timesteps < dino_threshold
+            
+            if dino_mask.any():
+                # DINOv3 uses patch_size=16, and our pixel space model uses patch_size=32
+                # So image dims are always multiples of 32 (thus multiples of 16) - no resize needed!
+                # Just convert from [-1, 1] to [0, 1] and normalize with ImageNet stats
+                pred_for_dino = (pred_clean_images[dino_mask] + 1) / 2  # Convert to [0, 1]
+                gt_for_dino = (gt_clean_images[dino_mask] + 1) / 2
+                
+                # Normalize for DINOv3 (ImageNet stats)
+                dino_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+                dino_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+                pred_for_dino = (pred_for_dino - dino_mean) / dino_std
+                gt_for_dino = (gt_for_dino - dino_mean) / dino_std
+                
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    # DINOv3 returns pooler_output (class token) for global features
+                    pred_outputs = dino_model(pixel_values=pred_for_dino)
+                    gt_outputs = dino_model(pixel_values=gt_for_dino)
+                    pred_features = pred_outputs.pooler_output
+                    gt_features = gt_outputs.pooler_output
+                
+                # Cosine similarity loss (1 - similarity)
+                pred_features = torch.nn.functional.normalize(pred_features, dim=-1)
+                gt_features = torch.nn.functional.normalize(gt_features, dim=-1)
+                similarity = (pred_features * gt_features).sum(dim=-1)
+                dino_loss_masked = 1 - similarity
+                
+                # Scatter back to full batch
+                dino_loss[dino_mask] = dino_loss_masked
+        
+        # Perceptual reconstruction loss (DINOv3 ConvNeXt or legacy LPIPS)
+        if self.training_config.use_lpips_loss and self.lpips_models:
+            perceptual_model = self.lpips_models[gpu_id]
+            lpips_threshold = self.training_config.lpips_timestep_threshold
+            
+            # Only compute for samples below timestep threshold
+            lpips_mask = timesteps < lpips_threshold
+            
+            if lpips_mask.any():
+                if self.training_config.use_convnext_lpips:
+                    # DINOv3 ConvNeXt: compute feature similarity (like DINO ViT but with ConvNeXt)
+                    # ConvNeXt can handle any resolution, no resize needed
+                    pred_for_convnext = (pred_clean_images[lpips_mask] + 1) / 2  # Convert to [0, 1]
+                    gt_for_convnext = (gt_clean_images[lpips_mask] + 1) / 2
+                    
+                    # Normalize with ImageNet stats
+                    convnext_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+                    convnext_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+                    pred_for_convnext = (pred_for_convnext - convnext_mean) / convnext_std
+                    gt_for_convnext = (gt_for_convnext - convnext_mean) / convnext_std
+                    
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        pred_outputs = perceptual_model(pixel_values=pred_for_convnext)
+                        gt_outputs = perceptual_model(pixel_values=gt_for_convnext)
+                        pred_features = pred_outputs.pooler_output
+                        gt_features = gt_outputs.pooler_output
+                    
+                    # Cosine similarity loss (1 - similarity), same as DINO ViT
+                    pred_features = torch.nn.functional.normalize(pred_features, dim=-1)
+                    gt_features = torch.nn.functional.normalize(gt_features, dim=-1)
+                    similarity = (pred_features * gt_features).sum(dim=-1)
+                    lpips_values = 1 - similarity
+                else:
+                    # Legacy LPIPS: expects images in [-1, 1] range (already in this range)
+                    with torch.autocast(device_type="cuda", dtype=torch.float32):  # LPIPS works better in fp32
+                        lpips_values = perceptual_model(
+                            pred_clean_images[lpips_mask].float(),
+                            gt_clean_images[lpips_mask].float()
+                        ).squeeze()
+                    
+                    # Handle single sample case
+                    if lpips_values.dim() == 0:
+                        lpips_values = lpips_values.unsqueeze(0)
+                
+                # Scatter back to full batch
+                lpips_loss[lpips_mask] = lpips_values
+        
+        return dino_loss, lpips_loss
+    
     def _forward_backward_on_gpu(
         self,
         gpu_id: int,
         images_chunk: torch.Tensor,
         captions_chunk: List[str],
         loss_weights_chunk: List[float],
-    ) -> float:
-        """Run forward/backward pass on a single GPU with its data chunk (pixel space)."""
+    ) -> Tuple[float, float, float, float]:
+        """Run forward/backward pass on a single GPU with its data chunk (pixel space).
+        
+        Returns:
+            Tuple of (total_loss, mse_loss, dino_loss, lpips_loss)
+        """
         device = f'cuda:{gpu_id}'
         model = self.models[gpu_id]
         text_encoder = self.text_encoders[gpu_id]
@@ -806,6 +1068,13 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         train_mb = self.training_config.train_minibatch
         num_minibatches = batch_size // train_mb
         total_loss = 0.0
+        total_mse_loss = 0.0
+        total_dino_loss = 0.0
+        total_lpips_loss = 0.0
+        
+        # Check if perceptual losses are enabled
+        use_dino = self.training_config.use_dino_loss and self.dino_models
+        use_lpips = self.training_config.use_lpips_loss and self.lpips_models
         
         for mb_idx in range(num_minibatches):
             start = mb_idx * train_mb
@@ -833,28 +1102,61 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
             
             # Forward pass
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                pred = model(
-                    img=noisy_pixels[start:end],
+                timesteps_mb = timesteps[start:end]
+                noisy_mb = noisy_pixels[start:end]
+                
+                # Call _forward directly to get x0 prediction (before velocity conversion)
+                pred_x0 = model._forward(
+                    img=noisy_mb,
                     img_ids=image_pos_ids,
                     img_mask=img_mask,
                     txt=text_embeds,
                     txt_ids=text_pos_ids,
                     txt_mask=text_mask,
-                    timesteps=timesteps[start:end],
+                    timesteps=timesteps_mb,
                 )
                 
-                # Compute loss
-                loss = ((pred - target[start:end]) ** 2).mean(dim=(1, 2))
+                # Convert x0 to velocity for MSE loss: v = (noisy - x0) / t
+                pred_v = model._apply_x0_residual(pred_x0, noisy_mb, timesteps_mb)
+                
+                # Compute MSE loss on velocity
+                mse_loss = ((pred_v - target[start:end]) ** 2).mean(dim=(1, 2))
+                
+                # Compute perceptual losses if enabled (using x0 directly - no reconstruction needed!)
+                if use_dino or use_lpips:
+                    # Ground truth x0 is just the original clean pixels
+                    gt_x0 = pixels[start:end]
+                    
+                    dino_loss, lpips_loss = self._compute_perceptual_losses(
+                        gpu_id=gpu_id,
+                        pred_x0_patches=pred_x0,
+                        gt_clean_patches=gt_x0,
+                        timesteps=timesteps_mb,
+                        pixel_shape=(train_mb, c, h, w),
+                    )
+                else:
+                    dino_loss = torch.zeros_like(mse_loss)
+                    lpips_loss = torch.zeros_like(mse_loss)
+                
+                # Combine losses
+                combined_loss = mse_loss.clone()
+                if use_dino:
+                    combined_loss = combined_loss + self.training_config.dino_loss_strength * dino_loss
+                if use_lpips:
+                    combined_loss = combined_loss + self.training_config.lpips_loss_strength * lpips_loss
                 
                 # Apply weights
                 mb_weights = loss_weights[start:end]
                 mb_weights = mb_weights / mb_weights.sum()
-                loss = (loss * mb_weights).sum() / num_minibatches
+                loss = (combined_loss * mb_weights).sum() / num_minibatches
             
             loss.backward()
             total_loss += loss.item()
+            total_mse_loss += (mse_loss * mb_weights).sum().item() / num_minibatches
+            total_dino_loss += (dino_loss * mb_weights).sum().item() / num_minibatches
+            total_lpips_loss += (lpips_loss * mb_weights).sum().item() / num_minibatches
         
-        return total_loss
+        return total_loss, total_mse_loss, total_dino_loss, total_lpips_loss
     
     def _clip_grads_on_gpu(self, gpu_id: int):
         """Clip gradients on a specific GPU."""
@@ -870,8 +1172,12 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         self.schedulers[gpu_id].step()
         self.optimizers[gpu_id].zero_grad()
     
-    def train_step(self, batch) -> float:
-        """Execute forward/backward pass across all GPUs (without all-reduce)."""
+    def train_step(self, batch) -> Dict[str, float]:
+        """Execute forward/backward pass across all GPUs (without all-reduce).
+        
+        Returns:
+            Dict with 'total', 'mse', 'dino', 'lpips' loss values
+        """
         images, captions, _, loss_weights = batch
         
         # Preprocess captions
@@ -893,10 +1199,20 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
             )
         
         # Forward/backward on all GPUs in parallel
-        losses = list(self.executor.map(gpu_forward_backward, range(self.n_gpus)))
-        total_loss = sum(losses) / self.n_gpus  # Average loss across GPUs
+        results = list(self.executor.map(gpu_forward_backward, range(self.n_gpus)))
         
-        return total_loss
+        # Aggregate losses across GPUs
+        total_loss = sum(r[0] for r in results) / self.n_gpus
+        mse_loss = sum(r[1] for r in results) / self.n_gpus
+        dino_loss = sum(r[2] for r in results) / self.n_gpus
+        lpips_loss = sum(r[3] for r in results) / self.n_gpus
+        
+        return {
+            'total': total_loss,
+            'mse': mse_loss,
+            'dino': dino_loss,
+            'lpips': lpips_loss,
+        }
     
     def _inference_on_gpu(
         self,
@@ -1064,7 +1380,7 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
                     batch_data = batch_data[0]  # Unwrap
                     
                     # Train step (forward/backward on all GPUs)
-                    loss = self.train_step(batch_data)
+                    losses = self.train_step(batch_data)
 
                     if (step + 1) % self.training_config.gradient_accumulation_steps == 0:
                         # All-reduce gradients across GPUs (synchronous on main thread)
@@ -1078,10 +1394,20 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
                     
                     # Update progress
                     lr = self.scheduler.get_last_lr()[0]
-                    pbar.set_postfix({"loss": f"{loss:.4f}", "lr": f"{lr:.2e}"})
+                    postfix = {"loss": f"{losses['total']:.4f}", "mse": f"{losses['mse']:.4f}", "lr": f"{lr:.2e}"}
+                    if self.training_config.use_dino_loss:
+                        postfix["dino"] = f"{losses['dino']:.4f}"
+                    if self.training_config.use_lpips_loss:
+                        postfix["lpips"] = f"{losses['lpips']:.4f}"
+                    pbar.set_postfix(postfix)
                     
                     # Logging
-                    self.logger.log_scalar("loss", loss, self.global_step)
+                    self.logger.log_scalar("loss/total", losses['total'], self.global_step)
+                    self.logger.log_scalar("loss/mse", losses['mse'], self.global_step)
+                    if self.training_config.use_dino_loss:
+                        self.logger.log_scalar("loss/dino", losses['dino'], self.global_step)
+                    if self.training_config.use_lpips_loss:
+                        self.logger.log_scalar("loss/lpips", losses['lpips'], self.global_step)
                     self.logger.log_scalar("learning_rate", lr, self.global_step)
                     
                     # Checkpointing
