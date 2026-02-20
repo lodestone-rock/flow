@@ -1110,8 +1110,8 @@ class ChromaTrainer(BaseTrainer):
 
             # Forward pass
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                # Call _forward directly to get x0 prediction
-                pred_x0 = model._forward(
+                # Call _forward directly to get x0 prediction (or velocity if use_x0=False)
+                pred_out = model._forward(
                     img=noisy_images[start:end],
                     img_ids=image_pos_id[start:end],
                     txt=text_embeds,
@@ -1121,17 +1121,23 @@ class ChromaTrainer(BaseTrainer):
                     guidance=static_guidance[start:end],
                 )
 
-                # Convert x0 to velocity for MSE loss
-                pred_v = model._apply_x0_residual(pred_x0, noisy_images[start:end], input_timestep[start:end])
+                if self.model_config.use_x0:
+                    # pred_out is x0: convert to velocity for MSE loss
+                    pred_v = model._apply_x0_residual(pred_out, noisy_images[start:end], input_timestep[start:end])
+                    pred_x0_for_perceptual = pred_out
+                else:
+                    # pred_out is already velocity
+                    pred_v = pred_out
+                    pred_x0_for_perceptual = None
 
                 # Compute MSE loss
                 mse_loss = ((pred_v - target[start:end]) ** 2).mean(dim=(1, 2, 3))
 
-                # Compute perceptual losses if enabled
-                if use_dino or use_lpips:
+                # Compute perceptual losses if enabled (only valid when use_x0=True)
+                if (use_dino or use_lpips) and pred_x0_for_perceptual is not None:
                     dino_loss, lpips_loss = self._compute_perceptual_losses(
                         gpu_id=gpu_id,
-                        pred_x0=pred_x0,
+                        pred_x0=pred_x0_for_perceptual,
                         gt_clean=gt_clean[start:end],
                         timesteps=input_timestep[start:end],
                     )
