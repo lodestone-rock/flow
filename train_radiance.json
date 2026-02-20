@@ -24,7 +24,14 @@
         "profile_json_dump": "profiler_dump_chroma.json",
         "use_aim": true,
         "aim_path": "aim://localhost:4893",
-        "aim_experiment_name": "nerf_conv_head"
+        "aim_experiment_name": "nerf_conv_head",
+        "dino_loss_strength": 0.0,
+        "dino_model_name": "",
+        "dino_timestep_threshold": 0.3,
+        "lpips_loss_strength": 0.0,
+        "lpips_net": "vgg",
+        "lpips_convnext_model": "",
+        "lpips_timestep_threshold": 0.3
     },
     "inference": {
         "inference_every": 50,
