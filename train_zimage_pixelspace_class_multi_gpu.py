@@ -343,24 +343,40 @@ class TextEncoder:
 # =============================================================================
 
 class ExperimentLogger:
-    """Handles experiment tracking with Aim."""
-    
-    def __init__(self, config: TrainingConfig, hparams: Dict[str, Any]):
+    """Handles experiment tracking with Aim or CSV fallback."""
+
+    def __init__(self, config: TrainingConfig, hparams: Dict[str, Any], save_folder: str = "."):
         self.enabled = AIM_AVAILABLE and config.use_aim and config.aim_path
         self.run = None
-        
+        self.csv_path = None
+        self.csv_file = None
+
         if self.enabled:
             self.run = Run(
                 repo=config.aim_path,
                 experiment=config.aim_experiment_name,
             )
             self.run["hparams"] = hparams
-    
+        else:
+            # Fallback to CSV logging
+            self.csv_path = os.path.join(save_folder, "training_log.csv")
+            file_exists = os.path.exists(self.csv_path)
+            self.csv_file = open(self.csv_path, "a", newline="")
+            self.csv_writer = __import__("csv").writer(self.csv_file)
+            if not file_exists:
+                self.csv_writer.writerow(["step", "name", "value"])
+                self.csv_file.flush()
+
     def log_scalar(self, name: str, value: float, step: int):
         """Log a scalar value."""
         if self.run:
             self.run.track(value, name=name, step=step)
-    
+        elif self.csv_file:
+            self.csv_writer.writerow([step, name, value])
+            # Flush periodically to ensure data is written
+            if step % 10 == 0:
+                self.csv_file.flush()
+
     def log_image(self, name: str, image_path: str, caption: str, step: int):
         """Log an image."""
         if self.run and AIM_AVAILABLE:
@@ -370,11 +386,15 @@ class ExperimentLogger:
                 name=name,
                 step=step,
             )
-    
+        # CSV doesn't support images, just skip
+
     def close(self):
         """Close the logger."""
         if self.run:
             self.run.close()
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
 
 
 # =============================================================================
@@ -952,11 +972,8 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
                     pred_features = pred_outputs.pooler_output
                     gt_features = gt_outputs.pooler_output
                 
-                # Cosine similarity loss (1 - similarity)
-                pred_features = torch.nn.functional.normalize(pred_features, dim=-1)
-                gt_features = torch.nn.functional.normalize(gt_features, dim=-1)
-                similarity = (pred_features * gt_features).sum(dim=-1)
-                dino_loss_masked = 1 - similarity
+                # MSE loss on features
+                dino_loss_masked = ((pred_features - gt_features) ** 2).mean(dim=-1)
                 
                 # Scatter back to full batch
                 dino_loss[dino_mask] = dino_loss_masked
@@ -988,11 +1005,8 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
                         pred_features = pred_outputs.pooler_output
                         gt_features = gt_outputs.pooler_output
                     
-                    # Cosine similarity loss (1 - similarity), same as DINO ViT
-                    pred_features = torch.nn.functional.normalize(pred_features, dim=-1)
-                    gt_features = torch.nn.functional.normalize(gt_features, dim=-1)
-                    similarity = (pred_features * gt_features).sum(dim=-1)
-                    lpips_values = 1 - similarity
+                    # MSE loss on features
+                    lpips_values = ((pred_features - gt_features) ** 2).mean(dim=-1)
                 else:
                     # Legacy LPIPS: expects images in [-1, 1] range (already in this range)
                     with torch.autocast(device_type="cuda", dtype=torch.float32):  # LPIPS works better in fp32
