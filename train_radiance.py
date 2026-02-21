@@ -1152,16 +1152,21 @@ class ChromaTrainer(BaseTrainer):
                 if use_lpips:
                     combined_loss = combined_loss + self.training_config.lpips_loss_strength * lpips_loss
 
-                # Apply weights
+                # Apply weights (already globally normalized in train_step).
+                # Each weight encodes the sample's fraction of the full batch,
+                # so we just sum — no further normalization needed.
                 mb_weights = loss_weights[start:end]
-                mb_weights = mb_weights / mb_weights.sum()
-                loss = (combined_loss * mb_weights).sum() / num_minibatches
+                loss = (combined_loss * mb_weights).sum()
 
-            loss.backward()
-            total_loss += loss.item()
-            total_mse_loss += (mse_loss * mb_weights).sum().item() / num_minibatches
-            total_dino_loss += (dino_loss * mb_weights).sum().item() / num_minibatches
-            total_lpips_loss += (lpips_loss * mb_weights).sum().item() / num_minibatches
+            # Scale down before backward so that gradient_accumulation_steps
+            # accumulated steps produce the same gradient magnitude as one step.
+            # Log the unscaled value so the reported loss is meaningful.
+            unscaled_loss = loss.item()
+            (loss / self.training_config.gradient_accumulation_steps).backward()
+            total_loss += unscaled_loss
+            total_mse_loss += (mse_loss * mb_weights).sum().item()
+            total_dino_loss += (dino_loss * mb_weights).sum().item()
+            total_lpips_loss += (lpips_loss * mb_weights).sum().item()
 
         return total_loss, total_mse_loss, total_dino_loss, total_lpips_loss
     
@@ -1194,6 +1199,11 @@ class ChromaTrainer(BaseTrainer):
         batch_size = images.shape[0]
         samples_per_gpu = batch_size // self.n_gpus
 
+        # Normalize weights globally over the full batch BEFORE splitting.
+        # This ensures the weighted loss is a proper mean over all batch samples
+        # regardless of how many GPUs are used.
+        loss_weights = loss_weights / loss_weights.sum()
+
         # Split batch across GPUs and run forward/backward in parallel
         def gpu_forward_backward(gpu_id):
             start = gpu_id * samples_per_gpu
@@ -1208,11 +1218,14 @@ class ChromaTrainer(BaseTrainer):
         # Forward/backward on all GPUs in parallel
         results = list(self.executor.map(gpu_forward_backward, range(self.n_gpus)))
 
-        # Aggregate losses across GPUs
-        total_loss = sum(r[0] for r in results) / self.n_gpus
-        mse_loss = sum(r[1] for r in results) / self.n_gpus
-        dino_loss = sum(r[2] for r in results) / self.n_gpus
-        lpips_loss = sum(r[3] for r in results) / self.n_gpus
+        # Aggregate losses across GPUs.
+        # Weights were globally normalized before splitting, so each GPU's loss
+        # is already a partial weighted sum. Summing them gives the full-batch
+        # weighted mean — no division by n_gpus needed.
+        total_loss = sum(r[0] for r in results)
+        mse_loss = sum(r[1] for r in results)
+        dino_loss = sum(r[2] for r in results)
+        lpips_loss = sum(r[3] for r in results)
 
         return {
             'total': total_loss,

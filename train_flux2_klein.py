@@ -1063,13 +1063,18 @@ class Flux2KleinTrainer(BaseTrainer):
                 # Compute loss (MSE between predicted velocity and target velocity)
                 loss = ((pred - target_packed[start:end]) ** 2).mean(dim=(1, 2))
 
-                # Apply weights
+                # Apply weights (already globally normalized in train_step).
+                # Each weight encodes the sample's fraction of the full batch,
+                # so we just sum — no further normalization needed.
                 mb_weights = loss_weights[start:end]
-                mb_weights = mb_weights / mb_weights.sum()
-                loss = (loss * mb_weights).sum() / num_minibatches
+                loss = (loss * mb_weights).sum()
 
-            loss.backward()
-            total_loss += loss.item()
+            # Scale down before backward so that gradient_accumulation_steps
+            # accumulated steps produce the same gradient magnitude as one step.
+            # Log the unscaled value so the reported loss is meaningful.
+            unscaled_loss = loss.item()
+            (loss / self.training_config.gradient_accumulation_steps).backward()
+            total_loss += unscaled_loss
 
         return total_loss
 
@@ -1106,6 +1111,11 @@ class Flux2KleinTrainer(BaseTrainer):
         batch_size = images.shape[0]
         samples_per_gpu = batch_size // self.n_gpus
 
+        # Normalize weights globally over the full batch BEFORE splitting.
+        # This ensures the weighted loss is a proper mean over all batch samples
+        # regardless of how many GPUs are used.
+        loss_weights = loss_weights / loss_weights.sum()
+
         # Split batch across GPUs and run forward/backward in parallel
         def gpu_forward_backward(gpu_id):
             start = gpu_id * samples_per_gpu
@@ -1125,7 +1135,10 @@ class Flux2KleinTrainer(BaseTrainer):
 
         # Forward/backward on all GPUs in parallel
         losses = list(self.executor.map(gpu_forward_backward, range(self.n_gpus)))
-        total_loss = sum(losses) / self.n_gpus  # Average loss across GPUs
+        # Weights were globally normalized before splitting, so each GPU's loss
+        # is already a partial weighted sum. Summing them gives the full-batch
+        # weighted mean — no division by n_gpus needed.
+        total_loss = sum(losses)
 
         return total_loss
 
