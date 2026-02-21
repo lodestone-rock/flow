@@ -1209,6 +1209,7 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         # Normalize weights globally over the full batch BEFORE splitting.
         # This ensures the weighted loss is a proper mean over all batch samples
         # regardless of how many GPUs are used.
+        loss_weights = torch.tensor(loss_weights, dtype=torch.float32)
         loss_weights = loss_weights / loss_weights.sum()
         
         # Split batch across GPUs and run forward/backward in parallel
