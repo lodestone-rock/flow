@@ -46,7 +46,8 @@ class TextImageDataset(Dataset):
         timeout=10,
         thread_per_worker=100,
         dummy_image=False,
-        offset=0
+        offset=0,
+        num_reference_images=None,  # Optional: number of reference images to load per sample
     ):
         # coarsened dataset, the batch is handled by the dataset and not the dataloader,
         # increase dataloader prefetch so this thing  run optimally!
@@ -66,6 +67,7 @@ class TextImageDataset(Dataset):
         self.rank_batch_size = batch_size // num_gpus
         self.timeout = timeout
         self.dummy_image = dummy_image
+        self.num_reference_images = num_reference_images  # None means disabled
         assert (
             batch_size % num_gpus
         ) == 0, "batch size is not divisible by the number of GPUs!"
@@ -119,7 +121,8 @@ class TextImageDataset(Dataset):
                 "bucket": res_bucket,
                 "is_tag_based": jsonl[i]["is_tag_based"],
                 "is_url_based": jsonl[i]["is_url_based"],
-                "loss_weight": jsonl[i]["loss_weight"]
+                "loss_weight": jsonl[i].get("loss_weight", 1),
+                "reference_images": jsonl[i].get("reference_images", []),
             }
 
             if res_bucket in buckets:
@@ -201,6 +204,11 @@ class TextImageDataset(Dataset):
     def get_batches(self):
         return self.batches
 
+    @staticmethod
+    def _is_url(path: str) -> bool:
+        """Check if a path is a URL by looking for http:// or https:// prefix."""
+        return path.startswith("http://") or path.startswith("https://")
+
     # def _round_robin(self):
     #     # reason we do round robbin here instead of classic torch distributed batch is because
     #     # we have bucketing and the shape is different for each gpu
@@ -231,7 +239,8 @@ class TextImageDataset(Dataset):
 
     def _load_image(self, sample, session, image_folder_path, timeout):
         try:
-            if sample["is_url_based"]:
+            # Auto-detect if filename is a URL (deprecates is_url_based flag)
+            if self._is_url(sample["filename"]):
                 response = session.get(sample["filename"], timeout=timeout)
                 response.raise_for_status()  # Raises an HTTPError if the status code is 4xx/5xx
                 return Image.open(BytesIO(response.content)).convert("RGB")
@@ -265,6 +274,36 @@ class TextImageDataset(Dataset):
             )
             return None
 
+    def _load_reference_image(self, ref_filename, session, image_folder_path, timeout):
+        """Load a single reference image by filename or URL."""
+        try:
+            # Auto-detect if ref_filename is a URL (deprecates is_url_based flag)
+            if self._is_url(ref_filename):
+                response = session.get(ref_filename, timeout=timeout)
+                response.raise_for_status()
+                return Image.open(BytesIO(response.content)).convert("RGB")
+            else:
+                image_path = os.path.join(image_folder_path, ref_filename)
+
+                # Check if a JXL version of the file exists and prioritize it
+                jxl_image_path = os.path.splitext(image_path)[0] + ".jxl"
+                if os.path.exists(jxl_image_path):
+                    return color_profile_handling.open_srgb(jxl_image_path).convert("RGB")
+                elif os.path.exists(image_path):
+                    return Image.open(image_path).convert("RGB")
+                else:
+                    # Try alternative extensions if the main file doesn't exist
+                    filename, _ = os.path.splitext(ref_filename)
+                    extensions = ["png", "jpg", "jpeg", "webp"]
+                    for ext in extensions:
+                        alt_image_path = os.path.join(image_folder_path, f"{filename}.{ext}")
+                        if os.path.exists(alt_image_path):
+                            return Image.open(alt_image_path).convert("RGB")
+            return None
+        except Exception as e:
+            log.error(f"An error occurred loading reference image: {e} for {ref_filename} on rank {self.rank}")
+            return None
+
     def __len__(self):
         return len(self.batches)
 
@@ -274,8 +313,11 @@ class TextImageDataset(Dataset):
         if not self.dummy_image:
             # Use threading for concurrent image loading
             raw_images = []
+            raw_reference_images = []  # List of lists, one per sample
+            
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = [
+                # Submit main image loading tasks
+                image_futures = [
                     executor.submit(
                         self._load_image,
                         sample,
@@ -285,11 +327,37 @@ class TextImageDataset(Dataset):
                     )
                     for sample in batch
                 ]
-                raw_images = [future.result() for future in futures]
+                
+                # Submit reference image loading tasks if enabled
+                ref_futures_per_sample = []
+                if self.num_reference_images is not None:
+                    for sample in batch:
+                        ref_list = sample.get("reference_images", [])
+                        # Truncate to num_reference_images
+                        ref_list = ref_list[:self.num_reference_images]
+                        sample_ref_futures = [
+                            executor.submit(
+                                self._load_reference_image,
+                                ref_filename,
+                                self.session,
+                                self.image_folder_path,
+                                self.timeout,
+                            )
+                            for ref_filename in ref_list
+                        ]
+                        ref_futures_per_sample.append(sample_ref_futures)
+                
+                raw_images = [future.result() for future in image_futures]
+                
+                # Collect reference images results
+                if self.num_reference_images is not None:
+                    for sample_ref_futures in ref_futures_per_sample:
+                        raw_reference_images.append([f.result() for f in sample_ref_futures])
 
         images = []
         training_prompts = []
         loss_weighting = []
+        reference_images_batch = []  # Will hold tensors of shape (num_reference_images, 3, H, W) per sample
 
         for i, sample in enumerate(batch):
             try:
@@ -303,6 +371,27 @@ class TextImageDataset(Dataset):
                     images.append(image)
                 else:
                     images.append(torch.zeros(3, standard_height, standard_width))
+                
+                # Process reference images if enabled
+                if self.num_reference_images is not None:
+                    ref_tensors = []
+                    if not self.dummy_image:
+                        raw_refs = raw_reference_images[i] if i < len(raw_reference_images) else []
+                        for ref_img in raw_refs:
+                            if ref_img is not None:
+                                # Reuse the same h, w from the main image bucket
+                                ref_img = self.scale_and_crop_long_axis(
+                                    ref_img, standard_height, standard_width
+                                )
+                                ref_tensors.append(self.image_transforms(ref_img))
+                    
+                    # Pad with zeros if we have fewer than num_reference_images
+                    while len(ref_tensors) < self.num_reference_images:
+                        ref_tensors.append(torch.zeros(3, standard_height, standard_width))
+                    
+                    # Stack into (num_reference_images, 3, H, W)
+                    reference_images_batch.append(torch.stack(ref_tensors, dim=0))
+                
                 # unconditional drop out
                 tmp = random.random()
                 if tmp >= 1 - self.uncond_percentage:
@@ -351,6 +440,8 @@ class TextImageDataset(Dataset):
                 images.append(images[echoed_index])
                 training_prompts.append(training_prompts[echoed_index])
                 loss_weighting.append(loss_weighting[echoed_index])
+                if self.num_reference_images is not None and len(reference_images_batch) > 0:
+                    reference_images_batch.append(reference_images_batch[echoed_index])
 
         # This check is now redundant but kept for safety
         while len(images) < 1:
@@ -362,4 +453,9 @@ class TextImageDataset(Dataset):
 
         images = torch.stack(images, dim=0)
 
-        return images, training_prompts, index, loss_weighting
+        # Stack reference images if enabled: (batch_size, num_reference_images, 3, H, W)
+        if self.num_reference_images is not None and len(reference_images_batch) > 0:
+            reference_images_batch = torch.stack(reference_images_batch, dim=0)
+            return images, training_prompts, index, loss_weighting, reference_images_batch
+        else:
+            return images, training_prompts, index, loss_weighting
