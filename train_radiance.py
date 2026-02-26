@@ -604,7 +604,7 @@ class ChromaTrainer(BaseTrainer):
                     if model_key in checkpoint_state_dict:
                         ckpt_tensor = checkpoint_state_dict[model_key]
                         if model_tensor.shape == ckpt_tensor.shape:
-                            model_state_dict[model_key] = ckpt_tensor.to(device=device, dtype=torch.bfloat16)
+                            model_state_dict[model_key] = ckpt_tensor.to(device=device, dtype=torch.float32)
                             loaded_keys.append(model_key)
                         else:
                             # Check if this is a patchify layer that needs dilation
@@ -615,16 +615,16 @@ class ChromaTrainer(BaseTrainer):
                                 # Dilate 16x16 -> 32x32
                                 weight_16 = ckpt_tensor.to(device=device)
                                 weight_32 = dilate_patchify_weight_16_to_32(weight_16)
-                                model_state_dict[model_key] = weight_32.to(torch.bfloat16)
+                                model_state_dict[model_key] = weight_32.to(torch.float32)
                                 dilated_keys.append(f"{model_key}: {list(ckpt_tensor.shape)} -> {list(model_tensor.shape)}")
                             elif need_dilation and is_patchify_bias:
                                 # Bias doesn't need scaling, just copy
-                                model_state_dict[model_key] = ckpt_tensor.to(device=device, dtype=torch.bfloat16)
+                                model_state_dict[model_key] = ckpt_tensor.to(device=device, dtype=torch.float32)
                                 dilated_keys.append(f"{model_key}: copied directly")
                             else:
                                 # Shape mismatch for non-patchify layers - random init
                                 model_state_dict[model_key] = torch.empty(
-                                    model_tensor.shape, device=device, dtype=torch.bfloat16
+                                    model_tensor.shape, device=device, dtype=torch.float32
                                 )
                                 if model_state_dict[model_key].dim() > 1:
                                     nn.init.kaiming_uniform_(model_state_dict[model_key])
@@ -635,7 +635,7 @@ class ChromaTrainer(BaseTrainer):
                                 )
                     else:
                         model_state_dict[model_key] = torch.empty(
-                            model_tensor.shape, device=device, dtype=torch.bfloat16
+                            model_tensor.shape, device=device, dtype=torch.float32
                         )
                         if model_state_dict[model_key].dim() > 1:
                             nn.init.kaiming_uniform_(model_state_dict[model_key])
@@ -668,18 +668,18 @@ class ChromaTrainer(BaseTrainer):
                             count = sum(1 for k in new_keys if k.startswith(prefix))
                             print(f"      - {prefix}.* ({count} params)")
             else:
-                # No checkpoint - random init directly on device
+                # No checkpoint - random init directly on device (fp32 for stability)
                 print("    No checkpoint provided, using random initialization")
                 model_state_dict = {}
                 for name, param in model.named_parameters():
-                    tensor = torch.empty(param.shape, device=device, dtype=torch.bfloat16)
+                    tensor = torch.empty(param.shape, device=device, dtype=torch.float32)
                     if tensor.dim() > 1:
                         nn.init.kaiming_uniform_(tensor)
                     else:
                         nn.init.zeros_(tensor)
                     model_state_dict[name] = tensor
                 for name, buf in model.named_buffers():
-                    model_state_dict[name] = torch.zeros(buf.shape, device=device, dtype=torch.bfloat16)
+                    model_state_dict[name] = torch.zeros(buf.shape, device=device, dtype=torch.float32)
                 
                 if self.model_config.use_x0:
                     model_state_dict["__x0__"] = torch.tensor([], device=device)
@@ -694,7 +694,7 @@ class ChromaTrainer(BaseTrainer):
         self.model = self.models[0]
         
         total_params = sum(p.numel() for p in self.model.parameters())
-        print(f"  Chroma loaded on {self.n_gpus} GPUs ({total_params:,} params each)")
+        print(f"  Chroma loaded on {self.n_gpus} GPUs ({total_params:,} params each, fp32 master weights)")
         print(f"  use_x0: {self.model_config.use_x0}, use_patch_size_32: {self.model_config.use_patch_size_32}")
     
     def _load_text_encoder(self):
@@ -1326,8 +1326,9 @@ class ChromaTrainer(BaseTrainer):
         return images
     
     def save_checkpoint(self, path: str):
-        """Save model checkpoint."""
-        torch.save(self.model.state_dict(), path)
+        """Save model checkpoint (converted to bf16 to save space)."""
+        state_dict = {k: v.to(torch.bfloat16) for k, v in self.model.state_dict().items()}
+        torch.save(state_dict, path)
         print(f"Saved checkpoint: {path}")
     
     def _create_dataloader(self) -> DataLoader:

@@ -10,7 +10,7 @@ Based on train_zimage_dct_class_multi_gpu.py but operates directly in pixel spac
 """
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
 import json
 import copy
 import random
@@ -540,7 +540,7 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         self._setup_dataset()
         
         # Setup logger
-        self.logger = ExperimentLogger(self.training_config, self.config_data)
+        self.logger = ExperimentLogger(self.training_config, self.config_data, save_folder=self.training_config.save_folder)
         
         # Setup thread pool for multi-GPU execution
         self.executor = ThreadPoolExecutor(max_workers=self.n_gpus)
@@ -604,6 +604,7 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
             
             if checkpoint_state_dict is not None:
                 # Materialize model with checkpoint weights directly on target device
+                # Use fp32 for master weights (training stability), save in bf16 later
                 model_state_dict = model.state_dict()
                 loaded_keys = []
                 shape_mismatch_keys = []
@@ -613,22 +614,22 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
                     if model_key in checkpoint_state_dict:
                         ckpt_tensor = checkpoint_state_dict[model_key]
                         if model_tensor.shape == ckpt_tensor.shape:
-                            # Shape matches - use checkpoint weight
-                            model_state_dict[model_key] = ckpt_tensor.to(device=device, dtype=torch.bfloat16)
+                            # Shape matches - use checkpoint weight (fp32 for stability)
+                            model_state_dict[model_key] = ckpt_tensor.to(device=device, dtype=torch.float32)
                             loaded_keys.append(model_key)
                         else:
-                            # Shape mismatch - random init on device
+                            # Shape mismatch - random init on device (fp32)
                             model_state_dict[model_key] = torch.empty(
-                                model_tensor.shape, device=device, dtype=torch.bfloat16
+                                model_tensor.shape, device=device, dtype=torch.float32
                             )
                             nn.init.kaiming_uniform_(model_state_dict[model_key]) if model_state_dict[model_key].dim() > 1 else nn.init.zeros_(model_state_dict[model_key])
                             shape_mismatch_keys.append(
                                 f"{model_key}: model={list(model_tensor.shape)} vs ckpt={list(ckpt_tensor.shape)}"
                             )
                     else:
-                        # New layer - random init on device
+                        # New layer - random init on device (fp32)
                         model_state_dict[model_key] = torch.empty(
-                            model_tensor.shape, device=device, dtype=torch.bfloat16
+                            model_tensor.shape, device=device, dtype=torch.float32
                         )
                         if model_state_dict[model_key].dim() > 1:
                             nn.init.kaiming_uniform_(model_state_dict[model_key])
@@ -654,18 +655,18 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
                             count = sum(1 for k in new_keys if k.startswith(prefix))
                             print(f"      - {prefix}.* ({count} params)")
             else:
-                # No checkpoint - random init directly on device
+                # No checkpoint - random init directly on device (fp32 for stability)
                 print("    No checkpoint provided, using random initialization")
                 model_state_dict = {}
                 for name, param in model.named_parameters():
-                    tensor = torch.empty(param.shape, device=device, dtype=torch.bfloat16)
+                    tensor = torch.empty(param.shape, device=device, dtype=torch.float32)
                     if tensor.dim() > 1:
                         nn.init.kaiming_uniform_(tensor)
                     else:
                         nn.init.zeros_(tensor)
                     model_state_dict[name] = tensor
                 for name, buf in model.named_buffers():
-                    model_state_dict[name] = torch.zeros(buf.shape, device=device, dtype=torch.bfloat16)
+                    model_state_dict[name] = torch.zeros(buf.shape, device=device, dtype=torch.float32)
                 
                 if self.model_config.use_x0:
                     model_state_dict["__x0__"] = torch.tensor([], device=device)
@@ -679,7 +680,7 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         
         total_params = sum(p.numel() for p in self.model.parameters())
         dec_net_params = sum(p.numel() for n, p in self.model.named_parameters() if 'dec_net' in n)
-        print(f"  Z-Image Pixel Space loaded on {self.n_gpus} GPUs ({total_params:,} params each)")
+        print(f"  Z-Image Pixel Space loaded on {self.n_gpus} GPUs ({total_params:,} params each, fp32 master weights)")
         print(f"  Patch size: {patch_size}x{patch_size}, in_channels: {in_channels}")
         print(f"  dec_net parameters: {dec_net_params:,}")
     
@@ -1350,8 +1351,10 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         return images
     
     def save_checkpoint(self, path: str):
-        """Save model checkpoint."""
-        torch.save(self.model.state_dict(), path)
+        """Save model checkpoint (converted to bf16 to save space)."""
+        # Convert fp32 master weights to bf16 for saving
+        state_dict = {k: v.to(torch.bfloat16) for k, v in self.model.state_dict().items()}
+        torch.save(state_dict, path)
         print(f"Saved checkpoint: {path}")
     
     def _create_dataloader(self) -> DataLoader:
