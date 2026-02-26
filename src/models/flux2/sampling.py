@@ -245,6 +245,105 @@ def denoise_cfg_batched_timesteps(
     return img
 
 
+def denoise_cfg_with_reference(
+    model: Flux2,
+    # model input
+    img: Tensor,
+    img_ids: Tensor,
+    # context
+    ctx: Tensor,
+    neg_ctx: Tensor,
+    # context IDs
+    ctx_ids: Tensor,
+    neg_ctx_ids: Tensor,
+    # sampling parameters
+    timesteps: list[float],
+    cfg: float = 2.0,
+    first_n_steps_without_cfg: int = 4,
+    # reference images for edit mode
+    ref_latents: Tensor = None,
+    ref_ids: Tensor = None,
+):
+    """Denoise with classifier-free guidance for Flux2/Klein models with optional reference images.
+
+    For image editing, reference image latents are concatenated with the noisy latents
+    along the sequence dimension. Each reference image has a unique T-coordinate offset
+    in its position IDs to distinguish it from the output latent (T=0).
+
+    Args:
+        model: Flux2/Klein model
+        img: Noisy latent [B, seq_len, C]
+        img_ids: Position IDs for output latent [B, seq_len, 4]
+        ctx: Positive text embeddings
+        neg_ctx: Negative text embeddings
+        ctx_ids: Positive text position IDs
+        neg_ctx_ids: Negative text position IDs
+        timesteps: List of timesteps for denoising
+        cfg: Classifier-free guidance scale
+        first_n_steps_without_cfg: Number of initial steps without CFG
+        ref_latents: Optional reference image latents [B, ref_seq_len, C]
+        ref_ids: Optional reference image position IDs [B, ref_seq_len, 4]
+
+    Returns:
+        Denoised latent [B, seq_len, C]
+    """
+    step_count = 0
+    batch_size = img.shape[0]
+    output_seq_len = img.shape[1]
+
+    # Prepare model input with reference images if provided
+    has_reference = ref_latents is not None and ref_ids is not None
+
+    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full((batch_size,), t_curr, dtype=img.dtype, device=img.device)
+
+        # Concatenate reference latents if in edit mode
+        if has_reference:
+            model_input = torch.cat([img, ref_latents], dim=1)
+            model_input_ids = torch.cat([img_ids, ref_ids], dim=1)
+        else:
+            model_input = img
+            model_input_ids = img_ids
+
+        pred = model(
+            x=model_input,
+            x_ids=model_input_ids,
+            timesteps=t_vec,
+            ctx=ctx,
+            ctx_ids=ctx_ids,
+            guidance=None,
+        )
+
+        # Extract only output tokens (exclude reference tokens)
+        if has_reference:
+            pred = pred[:, :output_seq_len, :]
+
+        # disable cfg for x steps before using cfg
+        if step_count < first_n_steps_without_cfg or first_n_steps_without_cfg == -1:
+            img = img.to(pred) + (t_prev - t_curr) * pred
+        else:
+            pred_neg = model(
+                x=model_input,
+                x_ids=model_input_ids,
+                timesteps=t_vec,
+                ctx=neg_ctx,
+                ctx_ids=neg_ctx_ids,
+                guidance=None,
+            )
+
+            # Extract only output tokens for negative prediction
+            if has_reference:
+                pred_neg = pred_neg[:, :output_seq_len, :]
+
+            pred_cfg = pred_neg + (pred - pred_neg) * cfg
+
+            img = img + (t_prev - t_curr) * pred_cfg
+
+        step_count += 1
+
+    return img
+
+
 def unpack(x: Tensor, height: int, width: int) -> Tensor:
     return rearrange(
         x,
