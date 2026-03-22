@@ -47,19 +47,35 @@
         "image_dim": [512, 512],
         "max_sequence_length": 512
     },
-    "dataloader": {
+    "parquet_dataloader": {
         "batch_size": 256,
-        "jsonl_metadata_path": "fast_training_weighted_blackblaze.jsonl",
-        "image_folder_path": "",
-        "base_resolution": [512],
-        "shuffle_tags": true,
+        "parquet_sources": {
+            "e621":       {"path": "training_parquet/source=e621",       "n_samples": 2000000},
+            "danbooru":   {"path": "training_parquet/source=danbooru",   "n_samples": 2000000},
+            "deviantart": {"path": "training_parquet/source=deviantart", "n_samples": 500000},
+            "midjourney": {"path": "training_parquet/source=midjourney", "n_samples": 500000},
+            "reddit":     {"path": "training_parquet/source=reddit",     "n_samples": 1000000}
+        },
+        "caption_columns": {
+            "tags":                     {"weight": 0.25, "is_tag_based": true},
+            "midjourney_style_summary": {"weight": 0.25, "is_tag_based": false},
+            "brief_summary":            {"weight": 0.25, "is_tag_based": false},
+            "10_word_summary":          {"weight": 0.25, "is_tag_based": false}
+        },
+        "filename_column":    "url",
+        "width_column":       "image_width",
+        "height_column":      "image_height",
+        "loss_weight_column": null,
+        "image_folder_path":  "",
+        "base_resolution":    [512],
+        "shuffle_tags":       true,
         "tag_drop_percentage": 0.3,
-        "uncond_percentage": 0.1,
-        "resolution_step": 64,
-        "num_workers": 4,
-        "prefetch_factor": 2,
-        "ratio_cutoff": 2.0,
-        "offset": 0
+        "uncond_percentage":  0.1,
+        "resolution_step":    64,
+        "num_workers":        4,
+        "prefetch_factor":    2,
+        "ratio_cutoff":       2.0,
+        "offset":             0
     },
     "model": {
         "z_image_path": "models/z-image-pixelspace/zeta-chroma-base-x0-pixel-proto.safetensors",

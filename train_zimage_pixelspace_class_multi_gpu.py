@@ -36,6 +36,7 @@ from transformers import AutoTokenizer, Qwen3ForCausalLM
 from torch.optim import AdamW
 
 from src.dataloaders.dataloader import TextImageDataset
+from src.dataloaders.parquet_dataloader import ParquetTextImageDataset
 from src.models.zimage.model_dct import ZImageDCT, ZImageDCTParams
 from src.models.zimage.sampling import get_schedule, denoise_cfg
 from src.models.zimage.utils import (
@@ -163,6 +164,30 @@ class DataloaderConfig:
     batch_size: int = 8
     jsonl_metadata_path: str = "metadata.jsonl"
     image_folder_path: str = "images"
+    base_resolution: List[int] = field(default_factory=lambda: [1024])
+    shuffle_tags: bool = True
+    tag_drop_percentage: float = 0.1
+    uncond_percentage: float = 0.1
+    resolution_step: int = 64
+    num_workers: int = 4
+    prefetch_factor: int = 2
+    ratio_cutoff: float = 2.0
+    offset: int = 0
+
+
+@dataclass
+class ParquetDataloaderConfig:
+    """Dataloader settings for ParquetTextImageDataset."""
+    batch_size: int = 8
+    # {source_name: {"path": str, "n_samples": int | null}}
+    parquet_sources: Dict[str, Any] = field(default_factory=dict)
+    # {col_name: {"weight": float, "is_tag_based": bool}}
+    caption_columns: Dict[str, Any] = field(default_factory=dict)
+    filename_column: str = "url"
+    width_column: str = "image_width"
+    height_column: str = "image_height"
+    loss_weight_column: Optional[str] = None
+    image_folder_path: str = ""
     base_resolution: List[int] = field(default_factory=lambda: [1024])
     shuffle_tags: bool = True
     tag_drop_percentage: float = 0.1
@@ -512,8 +537,17 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         """Parse configuration into dataclasses."""
         self.training_config = TrainingConfig(**self.config_data.get("training", {}))
         self.inference_config = InferenceConfig(**self.config_data.get("inference", {}))
-        self.dataloader_config = DataloaderConfig(**self.config_data.get("dataloader", {}))
         self.model_config = ModelConfig(**self.config_data.get("model", {}))
+
+        # Support both JSONL and Parquet dataloaders.
+        # If "parquet_dataloader" key is present, use ParquetTextImageDataset;
+        # otherwise fall back to the classic JSONL TextImageDataset.
+        if "parquet_dataloader" in self.config_data:
+            self.dataloader_config = ParquetDataloaderConfig(**self.config_data["parquet_dataloader"])
+            self._use_parquet = True
+        else:
+            self.dataloader_config = DataloaderConfig(**self.config_data.get("dataloader", {}))
+            self._use_parquet = False
     
     def setup(self):
         """Setup all components for training."""
@@ -865,22 +899,46 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
         self.scheduler = self.schedulers[0]
     
     def _setup_dataset(self):
-        """Setup training dataset."""
-        self.dataset = TextImageDataset(
-            batch_size=self.dataloader_config.batch_size,
-            jsonl_path=self.dataloader_config.jsonl_metadata_path,
-            image_folder_path=self.dataloader_config.image_folder_path,
-            base_res=self.dataloader_config.base_resolution,
-            shuffle_tags=self.dataloader_config.shuffle_tags,
-            tag_drop_percentage=self.dataloader_config.tag_drop_percentage,
-            uncond_percentage=self.dataloader_config.uncond_percentage,
-            resolution_step=self.dataloader_config.resolution_step,
-            seed=self.training_config.master_seed,
-            rank=0,
-            num_gpus=1,
-            ratio_cutoff=self.dataloader_config.ratio_cutoff,
-            offset=self.dataloader_config.offset,
-        )
+        """Setup training dataset (JSONL or Parquet depending on config)."""
+        if self._use_parquet:
+            cfg = self.dataloader_config  # ParquetDataloaderConfig
+            self.dataset = ParquetTextImageDataset(
+                batch_size=cfg.batch_size,
+                parquet_sources=cfg.parquet_sources,
+                caption_columns=cfg.caption_columns,
+                filename_column=cfg.filename_column,
+                width_column=cfg.width_column,
+                height_column=cfg.height_column,
+                loss_weight_column=cfg.loss_weight_column,
+                image_folder_path=cfg.image_folder_path,
+                base_res=cfg.base_resolution,
+                ratio_cutoff=cfg.ratio_cutoff,
+                resolution_step=cfg.resolution_step,
+                shuffle_tags=cfg.shuffle_tags,
+                tag_drop_percentage=cfg.tag_drop_percentage,
+                uncond_percentage=cfg.uncond_percentage,
+                seed=self.training_config.master_seed,
+                rank=0,
+                num_gpus=1,
+                offset=cfg.offset,
+            )
+        else:
+            cfg = self.dataloader_config  # DataloaderConfig
+            self.dataset = TextImageDataset(
+                batch_size=cfg.batch_size,
+                jsonl_path=cfg.jsonl_metadata_path,
+                image_folder_path=cfg.image_folder_path,
+                base_res=cfg.base_resolution,
+                shuffle_tags=cfg.shuffle_tags,
+                tag_drop_percentage=cfg.tag_drop_percentage,
+                uncond_percentage=cfg.uncond_percentage,
+                resolution_step=cfg.resolution_step,
+                seed=self.training_config.master_seed,
+                rank=0,
+                num_gpus=1,
+                ratio_cutoff=cfg.ratio_cutoff,
+                offset=cfg.offset,
+            )
     
     def _all_reduce_gradients(self):
         """All-reduce gradients across all GPU models using NCCL."""
@@ -1449,7 +1507,10 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
                         
                         # Update config
                         self.config_data["model"]["z_image_path"] = ckpt_path
-                        self.config_data["dataloader"]["offset"] = self.dataloader_config.offset + step
+                        if self._use_parquet:
+                            self.config_data["parquet_dataloader"]["offset"] = self.dataloader_config.offset + step
+                        else:
+                            self.config_data["dataloader"]["offset"] = self.dataloader_config.offset + step
                         self._save_config(f"{self.training_config.save_folder}/training_config.json")
                     
                     # Inference (distributed across GPUs)
@@ -1482,6 +1543,13 @@ class ZImagePixelSpaceTrainer(BaseTrainer):
                 # End of epoch checkpoint
                 timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
                 self.save_checkpoint(f"{self.training_config.save_folder}/{timestamp}_epoch_end.pth")
+
+                # Resample parquet dataset so next epoch draws a fresh subset.
+                # Reset offset to 0 since we're starting a clean new epoch.
+                if self._use_parquet:
+                    self.dataloader_config.offset = 0
+                    self.dataset.offset = 0
+                    self.dataset.resample()
 
 
 # =============================================================================
