@@ -1,0 +1,56 @@
+{
+    "training": {
+        "master_seed": 42,
+        "train_minibatch": 8,
+        "gradient_accumulation_steps": 1,
+        "lr": 1e-6,
+        "weight_decay": 0.01,
+        "warmup_steps": 50,
+        "max_grad_norm": 1.0,
+        "save_every": 1000,
+        "save_folder": "/mnt/datapool_u2/lodestone/tagger_dino_v3/checkpoints",
+        "pos_weight_cap": 100.0,
+        "pos_weight_temperature": 1.0,
+        "use_aim": false,
+        "aim_path": null,
+        "aim_experiment_name": null
+    },
+
+    "model": {
+        "backbone_name": "models/dinov3-vith16plus-pretrain-lvd1689m",
+        "checkpoint_path": "",
+        "dtype": "float32",
+        "freeze_backbone": false,
+        "projection_bias": false
+    },
+
+    "eval": {
+        "eval_every": 1000,
+        "eval_folder": "/mnt/datapool_u2/lodestone/tagger_dino_v3/tagger_eval"
+    },
+
+    "parquet_dataloader": {
+        "batch_size": 32,
+        "parquet_sources": {
+            "e621": {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/training_parquet/source=e621", "n_samples": 2500000},
+            "danbooru": {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/training_parquet/source=danbooru", "n_samples": 2500000}
+
+        },
+        "tag_columns": {
+            "tags": {"weight": 1.0}
+        },
+        "filename_column": "url",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [512],
+        "ratio_cutoff": 2.0,
+        "resolution_step": 16,
+        "min_tag_count": 50,
+        "num_workers": 4,
+        "prefetch_factor": 2,
+        "offset": 0,
+        "vocab_path": "/mnt/datapool_u2/lodestone/tagger_dino_v3/tagger_vocab.json"
+    }
+}
