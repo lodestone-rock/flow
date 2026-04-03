@@ -1,0 +1,49 @@
+{
+    "training": {
+        "master_seed": 42,
+        "gradient_accumulation_steps": 1,
+        "lr": 1e-4,
+        "weight_decay": 0.01,
+        "warmup_steps": 50,
+        "max_grad_norm": 1.0,
+        "save_every": 500,
+        "save_folder": "checkpoints_binary_lm_ar",
+        "trained_layer_keywords": [],
+        "use_aim": false,
+        "aim_path": null,
+        "aim_experiment_name": "binary_lm_ar"
+    },
+    "model": {
+        "checkpoint_path": "",
+        "max_seq_len": 256,
+        "hidden_dim": 768,
+        "n_layers": 12,
+        "n_heads": 12,
+        "n_kv_heads": 12,
+        "ffn_mult": 4.0,
+        "head_channels": 768,
+        "head_num_res_blocks": 4,
+        "adaln_embed_dim": 768,
+        "cfg_dropout": 0.1,
+        "use_x0": true
+    },
+    "inference": {
+        "inference_every": 50,
+        "inference_folder": "inference_binary_lm_ar",
+        "steps": 32,
+        "cfg_scale": 3.0,
+        "max_gen_tokens": 8,
+        "prompts": [
+            "a beautiful sunset",
+            "a cat sitting on"
+        ]
+    },
+    "dataloader": {
+        "data_dir": "datasets/codelion/fineweb-edu-1B/data",
+        "batch_size": 1024,
+        "num_workers": 4,
+        "prefetch_factor": 2,
+        "max_docs": null,
+        "text_column": "text"
+    }
+}
