@@ -26,7 +26,8 @@
         "profile_json_dump": "flux2_profiler_dump.json",
         "use_aim": false,
         "aim_path": "aim://localhost:4893",
-        "aim_experiment_name": "flux2_klein_training"
+        "aim_experiment_name": "flux2_klein_training",
+        "offload_text_encoder": false
     },
     "inference": {
         "inference_every": 1,
@@ -64,7 +65,9 @@
         "ratio_cutoff": 2.0,
         "num_reference_images": 1,
         "reference_image_t_scale": 10,
-        "offset": 0
+        "offset": 0,
+        "ref_kv_mode": true,
+        "ref_fixed_timestep": 0.0
     },
     "model": {
         "klein_path": "models/klein/flux-2-klein-base-4b.safetensors",
