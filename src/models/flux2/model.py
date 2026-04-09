@@ -125,7 +125,28 @@ class Flux2(nn.Module):
         ctx: Tensor,
         ctx_ids: Tensor,
         guidance: Tensor | None,
+        num_ref_tokens: int = 0,
+        ref_fixed_timestep: float = 0.0,
     ):
+        """Forward pass.
+
+        Args:
+            x: Image tokens [B, seq_len, C]. When num_ref_tokens > 0, the first
+               num_ref_tokens positions are reference image tokens and the rest are
+               noisy latent tokens (i.e. layout is [ref | noisy]).
+            x_ids: Image position IDs [B, seq_len, 4].
+            timesteps: Denoising timesteps for the noisy tokens [B], in [0, 1].
+            ctx: Text tokens [B, txt_len, C].
+            ctx_ids: Text position IDs [B, txt_len, 4].
+            guidance: Optional guidance scale embedding [B].
+            num_ref_tokens: Number of reference image tokens prepended to x.
+                When > 0, those tokens receive a fixed timestep conditioning
+                (ref_fixed_timestep) instead of the current denoising timestep,
+                matching the KV-mode inference behaviour where the reference image
+                is treated as a fully clean image (t=0).
+            ref_fixed_timestep: Timestep value used to condition reference tokens,
+                in [0, 1]. Default 0.0 = fully clean / no noise.
+        """
         num_txt_tokens = ctx.shape[1]
 
         timestep_emb = timestep_embedding(timesteps, 256)
@@ -137,6 +158,60 @@ class Flux2(nn.Module):
         double_block_mod_img = self.double_stream_modulation_img(vec)
         double_block_mod_txt = self.double_stream_modulation_txt(vec)
         single_block_mod, _ = self.single_stream_modulation(vec)
+
+        # KV-mode: blend per-token modulation so that reference tokens receive
+        # conditioning at ref_fixed_timestep (typically 0 = clean image) while
+        # noisy tokens keep the current denoising timestep.
+        if num_ref_tokens > 0:
+            ref_t = torch.full_like(timesteps, ref_fixed_timestep)
+            ref_emb = timestep_embedding(ref_t, 256)
+            ref_vec = self.time_in(ref_emb)
+            if self.use_guidance_embed and guidance is not None:
+                ref_vec = ref_vec + self.guidance_in(guidance_emb)
+
+            ref_double_mod_img = self.double_stream_modulation_img(ref_vec)
+            ref_single_mod, _ = self.single_stream_modulation(ref_vec)
+
+            num_noisy_tokens = x.shape[1] - num_ref_tokens
+
+            # double_block_mod_img is a tuple of two triples:
+            #   ((shift1, scale1, gate1), (shift2, scale2, gate2))
+            # each tensor has shape (B, 1, D) — broadcast over seq.
+            # Expand to (B, seq_len, D) and overwrite the ref slice.
+            def _blend_double(noisy_mod, ref_mod):
+                blended = []
+                for (n_s, n_sc, n_g), (r_s, r_sc, r_g) in zip(noisy_mod, ref_mod):
+                    # Expand broadcast dim to full sequence length
+                    seq_len = num_ref_tokens + num_noisy_tokens
+                    s  = n_s.expand(-1, seq_len, -1).clone()
+                    sc = n_sc.expand(-1, seq_len, -1).clone()
+                    g  = n_g.expand(-1, seq_len, -1).clone()
+                    s[:, :num_ref_tokens]  = r_s.expand(-1, num_ref_tokens, -1)
+                    sc[:, :num_ref_tokens] = r_sc.expand(-1, num_ref_tokens, -1)
+                    g[:, :num_ref_tokens]  = r_g.expand(-1, num_ref_tokens, -1)
+                    blended.append((s, sc, g))
+                return tuple(blended)
+
+            def _blend_single(noisy_mod, ref_mod):
+                # single_block_mod is a triple (shift, scale, gate), shape (B, 1, D)
+                # The single blocks operate on the concatenated [txt | img] sequence,
+                # so we need to account for the txt prefix.
+                txt_plus_seq = num_txt_tokens + num_ref_tokens + num_noisy_tokens
+                n_s, n_sc, n_g = noisy_mod
+                r_s, r_sc, r_g = ref_mod
+                s  = n_s.expand(-1, txt_plus_seq, -1).clone()
+                sc = n_sc.expand(-1, txt_plus_seq, -1).clone()
+                g  = n_g.expand(-1, txt_plus_seq, -1).clone()
+                # ref tokens sit right after txt tokens in the single-block sequence
+                ref_start = num_txt_tokens
+                ref_end   = num_txt_tokens + num_ref_tokens
+                s[:, ref_start:ref_end]  = r_s.expand(-1, num_ref_tokens, -1)
+                sc[:, ref_start:ref_end] = r_sc.expand(-1, num_ref_tokens, -1)
+                g[:, ref_start:ref_end]  = r_g.expand(-1, num_ref_tokens, -1)
+                return (s, sc, g)
+
+            double_block_mod_img = _blend_double(double_block_mod_img, ref_double_mod_img)
+            single_block_mod = _blend_single(single_block_mod, ref_single_mod)
 
         img = self.img_in(x)
         txt = self.txt_in(ctx)

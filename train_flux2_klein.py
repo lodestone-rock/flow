@@ -35,8 +35,8 @@ from tqdm import tqdm
 from safetensors.torch import safe_open
 
 from transformers import AutoTokenizer, Qwen3ForCausalLM
-from torch.optim import AdamW
-# from ramtorch import AdamW
+# from torch.optim import AdamW
+from ramtorch import AdamW
 
 from src.dataloaders.dataloader import TextImageDataset
 from src.models.flux2.model import Flux2, Klein4BParams, Klein9BParams
@@ -79,6 +79,11 @@ class TrainingConfig:
     profile_steps: int = 2
     profile_json_dump: str = "profiler_dump.json"
 
+    # Memory optimisation: move text encoder to CPU between encode calls to free
+    # VRAM for the model forward/backward pass. Adds a small CPU<->GPU transfer
+    # overhead per step but can save ~10-20 GB depending on the encoder size.
+    offload_text_encoder: bool = False
+
     # Experiment tracking
     use_aim: bool = False
     aim_path: Optional[str] = None
@@ -120,6 +125,11 @@ class DataloaderConfig:
     # Image editing settings
     num_reference_images: Optional[int] = None  # None = disabled, int = number of reference images
     reference_image_t_scale: int = 10  # T-coordinate scale for reference images (default: 10)
+    # KV-mode training: reference tokens receive a fixed timestep (clean image)
+    # instead of the same random timestep as the noisy latent tokens.
+    # Matches the KV-mode inference behaviour in pipeline_flux2_klein_kv.py.
+    ref_kv_mode: bool = False
+    ref_fixed_timestep: float = 0.0  # 0.0 = fully clean reference (t=0)
 
 
 @dataclass
@@ -273,6 +283,12 @@ class QwenTextEncoder:
         self.max_length = max_length
         self.device = device
         self.output_layers = output_layers
+
+    def to(self, device):
+        """Move the underlying Qwen model to the given device."""
+        self.qwen_model = self.qwen_model.to(device)
+        self.device = torch.device(device)
+        return self
 
     def _format_prompts(self, captions: List[str]) -> List[str]:
         """Format prompts with chat template."""
@@ -1021,8 +1037,12 @@ class Flux2KleinTrainer(BaseTrainer):
             end = start + train_mb
 
             # Encode text using this GPU's text encoder
+            if self.training_config.offload_text_encoder:
+                text_encoder.to(device)
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 text_embeds, text_mask = text_encoder.encode(captions_chunk[start:end])
+            if self.training_config.offload_text_encoder:
+                text_encoder.to('cpu')
 
             # Prepare text position IDs
             txt_ids = prepare_txt_ids(train_mb, text_embeds.shape[1], torch.device(device))
@@ -1031,19 +1051,32 @@ class Flux2KleinTrainer(BaseTrainer):
             mb_noisy_latents = noisy_latents_packed[start:end]
             mb_img_ids = img_ids[start:end]
 
+            ref_kv_mode = self.dataloader_config.ref_kv_mode
+            ref_fixed_timestep = self.dataloader_config.ref_fixed_timestep
+
             if ref_latents_packed is not None:
-                # Concatenate reference latents along sequence dimension
-                # [B, output_seq_len, C] + [B, ref_seq_len, C] -> [B, total_seq_len, C]
+                # Concatenate reference latents along sequence dimension.
+                # KV-mode: ref tokens come FIRST [ref | noisy] so the model can
+                # apply a separate fixed timestep conditioning to them.
+                # Default mode: ref tokens come LAST [noisy | ref] (original behaviour).
                 mb_ref_latents = ref_latents_packed[start:end]
                 mb_ref_ids = ref_img_ids[start:end]
+                num_ref_tokens = mb_ref_latents.shape[1]
 
-                model_input = torch.cat([mb_noisy_latents, mb_ref_latents], dim=1)
-                model_input_ids = torch.cat([mb_img_ids, mb_ref_ids], dim=1)
+                if ref_kv_mode:
+                    model_input = torch.cat([mb_ref_latents, mb_noisy_latents], dim=1)
+                    model_input_ids = torch.cat([mb_ref_ids, mb_img_ids], dim=1)
+                else:
+                    model_input = torch.cat([mb_noisy_latents, mb_ref_latents], dim=1)
+                    model_input_ids = torch.cat([mb_img_ids, mb_ref_ids], dim=1)
+                    num_ref_tokens = 0  # don't activate KV-mode blending in model
+
                 output_seq_len = mb_noisy_latents.shape[1]
             else:
                 model_input = mb_noisy_latents
                 model_input_ids = mb_img_ids
                 output_seq_len = None
+                num_ref_tokens = 0
 
             # Forward pass
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -1054,11 +1087,20 @@ class Flux2KleinTrainer(BaseTrainer):
                     ctx=text_embeds,
                     ctx_ids=txt_ids,
                     guidance=None,  # Klein models don't use guidance embedding
+                    num_ref_tokens=num_ref_tokens,
+                    ref_fixed_timestep=ref_fixed_timestep,
                 )
 
-                # Extract only output tokens (exclude reference tokens) if in edit mode
+                # Extract only output tokens (exclude reference tokens) if in edit mode.
+                # In KV-mode the ref tokens are at the front, in default mode at the back;
+                # either way we want the noisy-token outputs which are always num_ref_tokens
+                # away from the start (KV) or simply the first output_seq_len tokens (default).
                 if output_seq_len is not None:
-                    pred = pred[:, :output_seq_len, :]
+                    if ref_kv_mode:
+                        # layout after model strips txt: [ref | noisy] -> take noisy part
+                        pred = pred[:, num_ref_tokens:, :]
+                    else:
+                        pred = pred[:, :output_seq_len, :]
 
                 # Compute loss (MSE between predicted velocity and target velocity)
                 loss = ((pred - target_packed[start:end]) ** 2).mean(dim=(1, 2))
@@ -1191,8 +1233,12 @@ class Flux2KleinTrainer(BaseTrainer):
             timesteps = get_schedule(config.steps, image_seq_len)
 
             # Encode prompts
+            if self.training_config.offload_text_encoder:
+                text_encoder.to(device)
             qwen_embed, prompt_masks = text_encoder.encode(prompts)
             qwen_embed_neg, prompt_masks_neg = text_encoder.encode_negative(batch_size)
+            if self.training_config.offload_text_encoder:
+                text_encoder.to('cpu')
 
             # Prepare position IDs (4D format for Flux2)
             img_ids = prepare_img_ids(batch_size, height, width, device)
