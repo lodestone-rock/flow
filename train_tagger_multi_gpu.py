@@ -584,6 +584,32 @@ class TaggerTrainer:
         return torch.load(path, map_location="cpu")
 
     @staticmethod
+    def _remap_key(key: str, checkpoint_sd: Dict[str, torch.Tensor]) -> Optional[str]:
+        """Try several key remappings to bridge checkpoint ↔ model naming differences.
+
+        Known differences between a saved tagger checkpoint and the live model:
+          - Checkpoint saved without the HuggingFace `.model.` wrapper sub-module:
+              ckpt:  backbone.layer.N.*
+              model: backbone.model.layer.N.*
+          - Raw DINOv3 pretrained file (no backbone prefix):
+              ckpt:  layer.N.*  /  model.layer.N.*
+              model: backbone.model.layer.N.*  /  backbone.layer.N.*
+        """
+        candidates = [
+            key,                                          # 1. exact
+            key.replace("backbone.model.", "backbone."),  # 2. drop .model. wrapper
+            key.replace("backbone.", "backbone.model."),  # 3. add .model. wrapper
+            key[len("backbone."):] if key.startswith("backbone.") else None,  # 4. strip backbone.
+            f"backbone.{key}",                            # 5. add backbone.
+            key.replace("backbone.model.", ""),           # 6. strip backbone.model.
+            f"backbone.model.{key}",                      # 7. add backbone.model.
+        ]
+        for c in candidates:
+            if c and c in checkpoint_sd:
+                return c
+        return None
+
+    @staticmethod
     def _apply_state_dict(
         model: nn.Module,
         checkpoint_sd: Dict[str, torch.Tensor],
@@ -591,16 +617,23 @@ class TaggerTrainer:
     ) -> Tuple[List[str], List[str], List[str]]:
         model_sd = model.state_dict()
         loaded, mismatched, new = [], [], []
+
         for key, model_tensor in model_sd.items():
-            if key in checkpoint_sd:
-                ckpt_tensor = checkpoint_sd[key]
+            ckpt_key = TaggerTrainer._remap_key(key, checkpoint_sd)
+
+            if ckpt_key is not None:
+                ckpt_tensor = checkpoint_sd[ckpt_key]
                 if model_tensor.shape == ckpt_tensor.shape:
                     model_sd[key] = ckpt_tensor.to(device=device, dtype=model_tensor.dtype)
                     loaded.append(key)
                 else:
-                    mismatched.append(f"{key}: model={list(model_tensor.shape)} vs ckpt={list(ckpt_tensor.shape)}")
+                    mismatched.append(
+                        f"{key} (ckpt: {ckpt_key}): "
+                        f"model={list(model_tensor.shape)} vs ckpt={list(ckpt_tensor.shape)}"
+                    )
             else:
                 new.append(key)
+
         model.load_state_dict(model_sd, strict=False)
         return loaded, mismatched, new
 
@@ -816,7 +849,7 @@ class TaggerTrainer:
                     )
                     self.logger.log_scalar("eval/precision@10", metrics["precision@k"], self.global_step)
                     self.logger.log_scalar("eval/recall@10",    metrics["recall@k"],    self.global_step)
-                    eval_path = os.path.join(self.eval_config.eval_folder, f"eval_{self.global_step}.json")
+                    eval_path = os.path.join(self.eval_config.eval_folder, f"eval_2_{self.global_step}.json")
                     with open(eval_path, "w") as f:
                         json.dump({"step": self.global_step, **metrics}, f, indent=2)
 
